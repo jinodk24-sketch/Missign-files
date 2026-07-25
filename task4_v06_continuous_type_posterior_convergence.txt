@@ -1,0 +1,3044 @@
+# Task 4, Version 06: Continuous-Type Posterior Convergence Audit
+# =================================================================
+#
+# PURPOSE
+# -------
+# The worker's latent capacity C and resource aversion lambda are conceptually
+# continuous:
+#
+#     C in [8, 16]
+#     lambda in [0.4, 1.2]
+#
+# The worker's chosen effort remains discrete:
+#
+#     E = {0, 0.05, 0.10, ..., 1.00}.
+#
+# Earlier experiments used only 25 candidate parameter pairs. Version 06 tests
+# whether effort-aware predictive learning persists when the posterior over
+# continuous (C, lambda) is approximated by increasingly fine numerical
+# quadrature grids.
+#
+# SCIENTIFIC QUESTIONS
+# --------------------
+#   1. Does exact effort-aware inference still improve held-out reliability
+#      prediction for true workers with ordinary continuous parameter values?
+#
+#   2. Does support collapse disappear as the posterior approximation becomes
+#      sufficiently fine?
+#
+#   3. Do posterior-predictive curves converge toward a high-resolution
+#      reference approximation?
+#
+#   4. Are conclusions stable when the quadrature points are shifted inside
+#      their cells?
+#
+#   5. What grid size is accurate enough for later multi-worker simulation?
+#
+# IMPORTANT MODEL DISTINCTION
+# ---------------------------
+#   - C and lambda are continuous latent worker characteristics.
+#   - e is a discrete worker decision.
+#   - The numerical grid does NOT define a finite catalogue of worker types.
+#     It approximates integrals over a continuous parameter rectangle.
+#
+# BASELINE ASSUMPTIONS IN THIS AUDIT
+# ----------------------------------
+#   - deterministic rational best response;
+#   - exact effort observation;
+#   - no behavioral lapse;
+#   - no measurement noise;
+#   - known beta and payment rate;
+#   - uniform prior over the continuous parameter rectangle;
+#   - fixed workload sequence [6, 7, 8, 7, 6];
+#   - exact enumeration of all 2^5 binary outcome sequences.
+#
+# METHODS
+# -------
+#   outcome_only:
+#       uses workloads and binary outcomes.
+#
+#   exact_spread2:
+#       additionally observes exact effort in rounds 1 and 3,
+#       corresponding to workloads {6, 8}.
+#
+#   exact_unique3:
+#       additionally observes exact effort in rounds 1, 2, and 3,
+#       corresponding to workloads {6, 7, 8}.
+#
+# NUMERICAL APPROXIMATIONS
+# ------------------------
+# Midpoint grids:
+#
+#       5 x 5   =   25 points
+#       9 x 9   =   81 points
+#      17 x 17  =  289 points
+#      33 x 33  = 1089 points
+#      65 x 65  = 4225 points  (reference)
+#
+# Shifted 17 x 17 and 33 x 33 grids are also tested. The shifted points remain
+# inside the same equal-area cells, so each point retains equal prior weight.
+#
+# TRUE WORKERS
+# ------------
+# The script uses 25 deterministic continuous true parameter pairs. These values
+# do not coincide exactly with any tested quadrature point. There is no random
+# seed and no Monte Carlo sampling.
+#
+# PRIMARY OUTPUTS
+# ---------------
+#   - support-collapse rate;
+#   - held-out predictive RMSE, MAE, and Bernoulli KL;
+#   - predictive-curve RMSE relative to the 4225-point reference posterior;
+#   - paired improvement over outcome-only on the same outcome sequence;
+#   - phase-shift sensitivity;
+#   - runtime and approximate array memory;
+#   - an automatic convergence-screening table.
+#
+# INTERPRETING COLLAPSE
+# ---------------------
+# Literal exact matching can leave a coarse point grid with no compatible
+# quadrature point even though a compatible continuous parameter region exists.
+# Such cases are recorded as numerical support collapse.
+#
+# Predictive metrics for an exact method are reported conditionally over true
+# workers for which its numerical support does not collapse. A separate
+# conservative metric assigns RMSE=1 to collapsed cases.
+#
+# OUTPUT PACKAGE
+# --------------
+# The script creates a ZIP containing all CSV tables, configuration, summary,
+# and figures. Google Colab should download it automatically.
+#
+# Paste this entire file into one Google Colab cell and run it.
+
+
+import json
+import math
+import shutil
+import time
+import zipfile
+from collections import defaultdict
+from itertools import product
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from IPython.display import display
+
+
+# =================================================================
+# 1. CONFIGURATION
+# =================================================================
+
+SCRIPT_LABEL = "task4_v06_continuous_type_posterior_convergence"
+
+BETA = 8.0
+PAYMENT_PER_UNIT = 1.0
+
+EFFORT_STEP = 0.05
+EFFORT_GRID = np.round(
+    np.arange(0.0, 1.0 + EFFORT_STEP / 2.0, EFFORT_STEP),
+    10,
+)
+
+CAPACITY_MIN = 8.0
+CAPACITY_MAX = 16.0
+LAMBDA_MIN = 0.4
+LAMBDA_MAX = 1.2
+
+ALL_WORKLOADS = np.arange(4, 17, 1, dtype=float)
+TRAINING_WORKLOAD_SEQUENCE = np.array([6, 7, 8, 7, 6], dtype=float)
+HORIZON = len(TRAINING_WORKLOAD_SEQUENCE)
+
+HELDOUT_NEAR_WORKLOADS = np.array([4, 5, 9, 10], dtype=float)
+HELDOUT_FULL_WORKLOADS = np.array(
+    [4, 5, 9, 10, 11, 12, 13, 14, 15, 16],
+    dtype=float,
+)
+
+MONITOR_SCHEDULES = {
+    "exact_spread2": [1, 3],
+    "exact_unique3": [1, 2, 3],
+}
+
+METHOD_NAMES = [
+    "outcome_only",
+    "exact_spread2",
+    "exact_unique3",
+]
+
+# Each approximation partitions each parameter interval into n equal cells.
+# phase=0.5 gives midpoint quadrature.
+# phase=0.25 and phase=0.75 test within-cell point shifts.
+APPROXIMATION_DEFINITIONS = [
+    {
+        "approximation": "reference_65_midpoint",
+        "n_capacity": 65,
+        "n_lambda": 65,
+        "phase": 0.50,
+        "is_reference": True,
+    },
+    {
+        "approximation": "coarse_5_midpoint",
+        "n_capacity": 5,
+        "n_lambda": 5,
+        "phase": 0.50,
+        "is_reference": False,
+    },
+    {
+        "approximation": "medium_9_midpoint",
+        "n_capacity": 9,
+        "n_lambda": 9,
+        "phase": 0.50,
+        "is_reference": False,
+    },
+    {
+        "approximation": "fine_17_quarter",
+        "n_capacity": 17,
+        "n_lambda": 17,
+        "phase": 0.25,
+        "is_reference": False,
+    },
+    {
+        "approximation": "fine_17_midpoint",
+        "n_capacity": 17,
+        "n_lambda": 17,
+        "phase": 0.50,
+        "is_reference": False,
+    },
+    {
+        "approximation": "fine_17_threequarter",
+        "n_capacity": 17,
+        "n_lambda": 17,
+        "phase": 0.75,
+        "is_reference": False,
+    },
+    {
+        "approximation": "finer_33_quarter",
+        "n_capacity": 33,
+        "n_lambda": 33,
+        "phase": 0.25,
+        "is_reference": False,
+    },
+    {
+        "approximation": "finer_33_midpoint",
+        "n_capacity": 33,
+        "n_lambda": 33,
+        "phase": 0.50,
+        "is_reference": False,
+    },
+    {
+        "approximation": "finer_33_threequarter",
+        "n_capacity": 33,
+        "n_lambda": 33,
+        "phase": 0.75,
+        "is_reference": False,
+    },
+]
+
+REFERENCE_APPROXIMATION = "reference_65_midpoint"
+
+# Deterministic continuous true values. They are deliberately irregular and do
+# not coincide exactly with any quadrature point used above.
+TRUE_CAPACITY_VALUES = np.array(
+    [8.37, 10.06, 11.74, 13.43, 15.11],
+    dtype=float,
+)
+
+TRUE_LAMBDA_VALUES = np.array(
+    [0.43, 0.61, 0.79, 0.97, 1.15],
+    dtype=float,
+)
+
+# Numerical settings.
+ARGMAX_TOL = 1e-12
+PROBABILITY_CLIP = 1e-12
+SEQUENCE_PROBABILITY_SKIP = 1e-18
+METRIC_TIE_TOL = 1e-12
+
+# Conservative penalty used only in the explicitly labeled penalized metric.
+COLLAPSE_RMSE_PENALTY = 1.0
+
+# Provisional numerical convergence screens. These are engineering criteria,
+# not scientific claims.
+REFERENCE_CURVE_RMSE_TOLERANCE = 0.01
+AGGREGATE_RMSE_DIFFERENCE_TOLERANCE = 0.01
+PHASE_RANGE_TOLERANCE = 0.01
+
+OUTPUT_ROOT = Path("/content") if Path("/content").exists() else Path.cwd()
+OUTPUT_DIR = OUTPUT_ROOT / f"{SCRIPT_LABEL}_outputs"
+ZIP_PATH = OUTPUT_ROOT / f"{SCRIPT_LABEL}_outputs.zip"
+
+
+# =================================================================
+# 2. FORWARD MODEL
+# =================================================================
+
+def stable_sigmoid(x):
+    """Numerically stable logistic sigmoid."""
+    x = np.asarray(x, dtype=float)
+    output = np.empty_like(x)
+
+    nonnegative = x >= 0.0
+    output[nonnegative] = 1.0 / (
+        1.0 + np.exp(-x[nonnegative])
+    )
+
+    exp_x = np.exp(x[~nonnegative])
+    output[~nonnegative] = exp_x / (1.0 + exp_x)
+
+    return output
+
+
+def success_probability(effort, load_ratio):
+    """
+    Locked success model.
+
+    p(0, rho) = 0
+    p(e, rho) = sigmoid(beta * (e - rho)) for e > 0
+    """
+    effort = np.asarray(effort, dtype=float)
+    positive_probability = stable_sigmoid(
+        BETA * (effort - load_ratio)
+    )
+
+    return np.where(
+        effort <= 0.0,
+        0.0,
+        positive_probability,
+    )
+
+
+def per_unit_worker_utility(
+    effort,
+    workload,
+    capacity,
+    resource_aversion,
+):
+    """
+    Per-unit expected worker utility:
+        U(e) = b p(e, I/C) - lambda e^2.
+    """
+    effort = np.asarray(effort, dtype=float)
+    load_ratio = workload / capacity
+
+    return (
+        PAYMENT_PER_UNIT
+        * success_probability(effort, load_ratio)
+        - resource_aversion * effort**2
+    )
+
+
+def choose_optimal_effort(
+    workload,
+    capacity,
+    resource_aversion,
+):
+    """
+    Deterministic best response with lowest-effort tie-breaking.
+    """
+    utilities = per_unit_worker_utility(
+        EFFORT_GRID,
+        workload,
+        capacity,
+        resource_aversion,
+    )
+
+    maximum_utility = float(np.max(utilities))
+    maximizing_indices = np.flatnonzero(
+        np.isclose(
+            utilities,
+            maximum_utility,
+            atol=ARGMAX_TOL,
+            rtol=0.0,
+        )
+    )
+
+    best_index = int(maximizing_indices[0])
+    best_effort = float(EFFORT_GRID[best_index])
+
+    best_probability = float(
+        success_probability(
+            np.array([best_effort]),
+            workload / capacity,
+        )[0]
+    )
+
+    return best_effort, best_probability, maximum_utility
+
+
+def true_type_id(capacity, resource_aversion):
+    """Readable deterministic identifier."""
+    return (
+        f"true_C{capacity:05.2f}_L{resource_aversion:04.2f}"
+        .replace(".", "p")
+    )
+
+
+# =================================================================
+# 3. QUADRATURE GRID CONSTRUCTION
+# =================================================================
+
+def make_cell_phase_points(
+    lower,
+    upper,
+    cell_count,
+    phase,
+):
+    """
+    One quadrature point inside each equal-width cell.
+
+    phase=0.5 is the midpoint rule.
+    phase=0.25 and 0.75 produce shifted within-cell rules.
+    """
+    cell_width = (upper - lower) / cell_count
+
+    points = lower + (
+        np.arange(cell_count, dtype=float) + phase
+    ) * cell_width
+
+    return points, cell_width
+
+
+def build_approximation(definition):
+    """
+    Construct one equal-weight quadrature approximation.
+    """
+    capacity_points, capacity_cell_width = (
+        make_cell_phase_points(
+            CAPACITY_MIN,
+            CAPACITY_MAX,
+            definition["n_capacity"],
+            definition["phase"],
+        )
+    )
+
+    lambda_points, lambda_cell_width = (
+        make_cell_phase_points(
+            LAMBDA_MIN,
+            LAMBDA_MAX,
+            definition["n_lambda"],
+            definition["phase"],
+        )
+    )
+
+    capacity_mesh, lambda_mesh = np.meshgrid(
+        capacity_points,
+        lambda_points,
+        indexing="ij",
+    )
+
+    capacity_vector = capacity_mesh.ravel()
+    lambda_vector = lambda_mesh.ravel()
+    candidate_count = len(capacity_vector)
+
+    effort_matrix = np.zeros(
+        (len(ALL_WORKLOADS), candidate_count),
+        dtype=float,
+    )
+
+    probability_matrix = np.zeros(
+        (len(ALL_WORKLOADS), candidate_count),
+        dtype=float,
+    )
+
+    utility_matrix = np.zeros(
+        (len(ALL_WORKLOADS), candidate_count),
+        dtype=float,
+    )
+
+    # Vectorization is over candidate types; the effort grid is only 21 values.
+    for workload_index, workload in enumerate(ALL_WORKLOADS):
+        for candidate_index in range(candidate_count):
+            effort, probability, utility = choose_optimal_effort(
+                workload,
+                capacity_vector[candidate_index],
+                lambda_vector[candidate_index],
+            )
+
+            effort_matrix[
+                workload_index,
+                candidate_index,
+            ] = effort
+
+            probability_matrix[
+                workload_index,
+                candidate_index,
+            ] = probability
+
+            utility_matrix[
+                workload_index,
+                candidate_index,
+            ] = utility
+
+    prior = np.full(
+        candidate_count,
+        1.0 / candidate_count,
+        dtype=float,
+    )
+
+    return {
+        "definition": definition,
+        "capacity_points": capacity_points,
+        "lambda_points": lambda_points,
+        "capacity_cell_width": capacity_cell_width,
+        "lambda_cell_width": lambda_cell_width,
+        "capacity_vector": capacity_vector,
+        "lambda_vector": lambda_vector,
+        "candidate_count": candidate_count,
+        "effort_matrix": effort_matrix,
+        "probability_matrix": probability_matrix,
+        "utility_matrix": utility_matrix,
+        "prior": prior,
+        "log_prior": np.log(prior),
+    }
+
+
+# =================================================================
+# 4. VALIDATE CONFIGURATION
+# =================================================================
+
+def validate_configuration():
+    assert BETA > 0.0
+    assert PAYMENT_PER_UNIT > 0.0
+    assert EFFORT_STEP > 0.0
+
+    assert np.isclose(EFFORT_GRID[0], 0.0)
+    assert np.isclose(EFFORT_GRID[-1], 1.0)
+    assert np.all(np.diff(EFFORT_GRID) > 0.0)
+
+    assert CAPACITY_MIN < CAPACITY_MAX
+    assert LAMBDA_MIN < LAMBDA_MAX
+
+    assert np.all(
+        (TRUE_CAPACITY_VALUES > CAPACITY_MIN)
+        & (TRUE_CAPACITY_VALUES < CAPACITY_MAX)
+    )
+
+    assert np.all(
+        (TRUE_LAMBDA_VALUES > LAMBDA_MIN)
+        & (TRUE_LAMBDA_VALUES < LAMBDA_MAX)
+    )
+
+    assert len(TRAINING_WORKLOAD_SEQUENCE) == HORIZON
+    assert HORIZON == 5
+
+    for monitored_rounds in MONITOR_SCHEDULES.values():
+        assert all(
+            1 <= round_number <= HORIZON
+            for round_number in monitored_rounds
+        )
+
+    assert set(HELDOUT_NEAR_WORKLOADS.tolist()).isdisjoint(
+        set(TRAINING_WORKLOAD_SEQUENCE.tolist())
+    )
+
+    approximation_names = [
+        item["approximation"]
+        for item in APPROXIMATION_DEFINITIONS
+    ]
+
+    assert len(approximation_names) == len(
+        set(approximation_names)
+    )
+
+    assert REFERENCE_APPROXIMATION in approximation_names
+
+    reference_count = sum(
+        item["is_reference"]
+        for item in APPROXIMATION_DEFINITIONS
+    )
+
+    assert reference_count == 1
+
+    p_zero = success_probability(np.array([0.0]), 0.75)[0]
+    assert np.isclose(p_zero, 0.0)
+
+    p_at_capacity = success_probability(
+        np.array([1.0]),
+        1.0,
+    )[0]
+    assert np.isclose(p_at_capacity, 0.5)
+
+    calibrated_effort, _, _ = choose_optimal_effort(
+        workload=9.0,
+        capacity=12.0,
+        resource_aversion=0.8,
+    )
+
+    assert np.isclose(calibrated_effort, 0.9)
+
+
+validate_configuration()
+
+
+# =================================================================
+# 5. OUTPUT DIRECTORY
+# =================================================================
+
+if OUTPUT_DIR.exists():
+    shutil.rmtree(OUTPUT_DIR)
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+
+# =================================================================
+# 6. WORKLOAD INDEXING AND EVALUATION SETS
+# =================================================================
+
+WORKLOAD_TO_INDEX = {
+    float(workload): index
+    for index, workload in enumerate(ALL_WORKLOADS)
+}
+
+TRAINING_WORKLOAD_INDICES = np.array(
+    [
+        WORKLOAD_TO_INDEX[float(workload)]
+        for workload in TRAINING_WORKLOAD_SEQUENCE
+    ],
+    dtype=int,
+)
+
+EVALUATION_SETS = {
+    "heldout_near": HELDOUT_NEAR_WORKLOADS,
+    "heldout_full": HELDOUT_FULL_WORKLOADS,
+    "all_workloads": ALL_WORKLOADS,
+}
+
+EVALUATION_INDICES = {
+    name: np.array(
+        [
+            WORKLOAD_TO_INDEX[float(workload)]
+            for workload in workloads
+        ],
+        dtype=int,
+    )
+    for name, workloads in EVALUATION_SETS.items()
+}
+
+
+# =================================================================
+# 7. TRUE CONTINUOUS WORKERS
+# =================================================================
+
+true_type_rows = []
+true_runtime_data = {}
+
+for capacity in TRUE_CAPACITY_VALUES:
+    for resource_aversion in TRUE_LAMBDA_VALUES:
+        current_type_id = true_type_id(
+            capacity,
+            resource_aversion,
+        )
+
+        effort_curve = np.zeros(
+            len(ALL_WORKLOADS),
+            dtype=float,
+        )
+
+        probability_curve = np.zeros(
+            len(ALL_WORKLOADS),
+            dtype=float,
+        )
+
+        utility_curve = np.zeros(
+            len(ALL_WORKLOADS),
+            dtype=float,
+        )
+
+        for workload_index, workload in enumerate(ALL_WORKLOADS):
+            effort, probability, utility = choose_optimal_effort(
+                workload,
+                capacity,
+                resource_aversion,
+            )
+
+            effort_curve[workload_index] = effort
+            probability_curve[workload_index] = probability
+            utility_curve[workload_index] = utility
+
+        training_efforts = effort_curve[
+            TRAINING_WORKLOAD_INDICES
+        ]
+
+        training_probabilities = probability_curve[
+            TRAINING_WORKLOAD_INDICES
+        ]
+
+        true_type_rows.append(
+            {
+                "true_type_id": current_type_id,
+                "true_capacity": float(capacity),
+                "true_lambda": float(resource_aversion),
+                "training_effort_signature": "|".join(
+                    f"{value:.2f}"
+                    for value in training_efforts
+                ),
+                "training_probability_signature": "|".join(
+                    f"{value:.8f}"
+                    for value in training_probabilities
+                ),
+            }
+        )
+
+        true_runtime_data[current_type_id] = {
+            "effort_curve": effort_curve,
+            "probability_curve": probability_curve,
+            "utility_curve": utility_curve,
+            "training_efforts": training_efforts,
+            "training_probabilities": training_probabilities,
+        }
+
+true_types_df = pd.DataFrame(true_type_rows)
+TRUE_TYPE_COUNT = len(true_types_df)
+
+
+# =================================================================
+# 8. ASSERT TRUE VALUES ARE NOT QUADRATURE NODES
+# =================================================================
+
+node_coincidence_rows = []
+
+for definition in APPROXIMATION_DEFINITIONS:
+    capacity_points, _ = make_cell_phase_points(
+        CAPACITY_MIN,
+        CAPACITY_MAX,
+        definition["n_capacity"],
+        definition["phase"],
+    )
+
+    lambda_points, _ = make_cell_phase_points(
+        LAMBDA_MIN,
+        LAMBDA_MAX,
+        definition["n_lambda"],
+        definition["phase"],
+    )
+
+    for _, true_row in true_types_df.iterrows():
+        capacity_match = bool(
+            np.any(
+                np.isclose(
+                    capacity_points,
+                    true_row["true_capacity"],
+                    atol=1e-12,
+                    rtol=0.0,
+                )
+            )
+        )
+
+        lambda_match = bool(
+            np.any(
+                np.isclose(
+                    lambda_points,
+                    true_row["true_lambda"],
+                    atol=1e-12,
+                    rtol=0.0,
+                )
+            )
+        )
+
+        node_coincidence_rows.append(
+            {
+                "approximation": definition["approximation"],
+                "true_type_id": true_row["true_type_id"],
+                "capacity_is_grid_node": capacity_match,
+                "lambda_is_grid_node": lambda_match,
+                "complete_type_is_grid_node": (
+                    capacity_match and lambda_match
+                ),
+            }
+        )
+
+node_coincidence_df = pd.DataFrame(
+    node_coincidence_rows
+)
+
+assert not node_coincidence_df[
+    "complete_type_is_grid_node"
+].any(), (
+    "At least one true type coincides with a quadrature point. "
+    "Change the deterministic true values."
+)
+
+
+# =================================================================
+# 9. BAYESIAN AND METRIC FUNCTIONS
+# =================================================================
+
+def normalize_log_weights(log_weights):
+    """Normalize a finite-support log posterior."""
+    log_weights = np.asarray(log_weights, dtype=float)
+    finite_mask = np.isfinite(log_weights)
+
+    if not np.any(finite_mask):
+        return None
+
+    maximum = float(np.max(log_weights[finite_mask]))
+
+    shifted = np.zeros_like(log_weights)
+    shifted[finite_mask] = np.exp(
+        log_weights[finite_mask] - maximum
+    )
+
+    total = float(np.sum(shifted))
+
+    if total <= 0.0 or not np.isfinite(total):
+        return None
+
+    return shifted / total
+
+
+def candidate_outcome_log_likelihood(
+    candidate_training_probabilities,
+    outcomes,
+):
+    """
+    Candidate-wise log likelihood of one complete binary outcome sequence.
+    """
+    outcomes = np.asarray(outcomes, dtype=int)
+    candidate_training_probabilities = np.asarray(
+        candidate_training_probabilities,
+        dtype=float,
+    )
+
+    total_log_likelihood = np.zeros(
+        candidate_training_probabilities.shape[1],
+        dtype=float,
+    )
+
+    for round_index, outcome in enumerate(outcomes):
+        probabilities = candidate_training_probabilities[
+            round_index
+        ]
+
+        if outcome == 1:
+            with np.errstate(divide="ignore"):
+                contribution = np.log(probabilities)
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                contribution = np.log1p(-probabilities)
+
+        total_log_likelihood += contribution
+
+    return total_log_likelihood
+
+
+def exact_effort_support_mask(
+    candidate_effort_matrix,
+    true_training_efforts,
+    monitored_rounds,
+):
+    """
+    Candidate points compatible with all exact monitored effort observations.
+    """
+    support = np.ones(
+        candidate_effort_matrix.shape[1],
+        dtype=bool,
+    )
+
+    support_sizes_by_round = []
+
+    for round_number in monitored_rounds:
+        workload_index = TRAINING_WORKLOAD_INDICES[
+            round_number - 1
+        ]
+
+        observed_effort = float(
+            true_training_efforts[round_number - 1]
+        )
+
+        support &= np.isclose(
+            candidate_effort_matrix[workload_index],
+            observed_effort,
+            atol=1e-12,
+            rtol=0.0,
+        )
+
+        support_sizes_by_round.append(int(np.sum(support)))
+
+    return support, support_sizes_by_round
+
+
+def sequence_probability(
+    outcomes,
+    true_training_probabilities,
+):
+    """Exact probability of one binary outcome sequence."""
+    probability = 1.0
+
+    for outcome, success_probability_value in zip(
+        outcomes,
+        true_training_probabilities,
+    ):
+        probability *= (
+            success_probability_value
+            if outcome == 1
+            else 1.0 - success_probability_value
+        )
+
+    return float(probability)
+
+
+def bernoulli_kl(
+    true_probability,
+    predicted_probability,
+):
+    """
+    KL(Bernoulli(true) || Bernoulli(predicted)).
+    """
+    p = np.clip(
+        np.asarray(true_probability, dtype=float),
+        PROBABILITY_CLIP,
+        1.0 - PROBABILITY_CLIP,
+    )
+
+    q = np.clip(
+        np.asarray(predicted_probability, dtype=float),
+        PROBABILITY_CLIP,
+        1.0 - PROBABILITY_CLIP,
+    )
+
+    return (
+        p * np.log(p / q)
+        + (1.0 - p) * np.log((1.0 - p) / (1.0 - q))
+    )
+
+
+def posterior_entropy(posterior):
+    positive = posterior > 0.0
+
+    return float(
+        -np.sum(
+            posterior[positive]
+            * np.log(posterior[positive])
+        )
+    )
+
+
+def compute_predictive_metrics(
+    posterior,
+    predicted_curve,
+    true_curve,
+    capacity_vector,
+    lambda_vector,
+    true_capacity,
+    true_lambda,
+):
+    """
+    Predictive metrics for one posterior and one outcome sequence.
+    """
+    metrics = {
+        "posterior_entropy": posterior_entropy(posterior),
+        "normalized_posterior_entropy": (
+            posterior_entropy(posterior)
+            / math.log(len(posterior))
+        ),
+        "posterior_mean_capacity": float(
+            np.dot(posterior, capacity_vector)
+        ),
+        "posterior_mean_lambda": float(
+            np.dot(posterior, lambda_vector)
+        ),
+    }
+
+    metrics["capacity_absolute_error"] = abs(
+        metrics["posterior_mean_capacity"]
+        - true_capacity
+    )
+
+    metrics["lambda_absolute_error"] = abs(
+        metrics["posterior_mean_lambda"]
+        - true_lambda
+    )
+
+    for evaluation_name, indices in EVALUATION_INDICES.items():
+        true_values = true_curve[indices]
+        predicted_values = predicted_curve[indices]
+
+        absolute_error = np.abs(
+            predicted_values - true_values
+        )
+
+        squared_error = (
+            predicted_values - true_values
+        ) ** 2
+
+        kl_values = bernoulli_kl(
+            true_values,
+            predicted_values,
+        )
+
+        metrics[f"{evaluation_name}_mae"] = float(
+            np.mean(absolute_error)
+        )
+
+        metrics[f"{evaluation_name}_rmse"] = float(
+            np.sqrt(np.mean(squared_error))
+        )
+
+        metrics[f"{evaluation_name}_mean_kl"] = float(
+            np.mean(kl_values)
+        )
+
+        metrics[
+            f"{evaluation_name}_max_abs_error"
+        ] = float(np.max(absolute_error))
+
+    return metrics
+
+
+# =================================================================
+# 10. PROGRESS TRACKER
+# =================================================================
+
+class ProgressTracker:
+    """
+    Candidate-count-weighted progress indicator.
+    """
+
+    def __init__(
+        self,
+        total_units,
+        report_every_percent=1.0,
+    ):
+        self.total_units = float(total_units)
+        self.completed_units = 0.0
+        self.report_every_percent = float(
+            report_every_percent
+        )
+        self.next_report_percent = 0.0
+        self.start_time = time.perf_counter()
+
+    @staticmethod
+    def format_seconds(seconds):
+        if not np.isfinite(seconds):
+            return "unknown"
+
+        seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        if hours > 0:
+            return (
+                f"{hours:d}h "
+                f"{minutes:02d}m "
+                f"{seconds:02d}s"
+            )
+
+        if minutes > 0:
+            return f"{minutes:d}m {seconds:02d}s"
+
+        return f"{seconds:d}s"
+
+    def update(self, units, context=""):
+        self.completed_units += float(units)
+
+        percent = min(
+            100.0,
+            100.0
+            * self.completed_units
+            / self.total_units,
+        )
+
+        if (
+            percent + 1e-12
+            < self.next_report_percent
+            and percent < 100.0
+        ):
+            return
+
+        elapsed = time.perf_counter() - self.start_time
+
+        if self.completed_units > 0.0:
+            estimated_total = (
+                elapsed
+                * self.total_units
+                / self.completed_units
+            )
+
+            eta = max(0.0, estimated_total - elapsed)
+        else:
+            eta = math.inf
+
+        suffix = f" | {context}" if context else ""
+
+        print(
+            f"Progress: {percent:6.2f}%"
+            f" | elapsed {self.format_seconds(elapsed)}"
+            f" | ETA {self.format_seconds(eta)}"
+            f"{suffix}",
+            flush=True,
+        )
+
+        while (
+            self.next_report_percent
+            <= percent + 1e-12
+        ):
+            self.next_report_percent += (
+                self.report_every_percent
+            )
+
+
+total_candidate_sequence_units = sum(
+    definition["n_capacity"]
+    * definition["n_lambda"]
+    * TRUE_TYPE_COUNT
+    * (2 ** HORIZON)
+    for definition in APPROXIMATION_DEFINITIONS
+)
+
+progress_tracker = ProgressTracker(
+    total_units=total_candidate_sequence_units,
+    report_every_percent=1.0,
+)
+
+
+# =================================================================
+# 11. MAIN EXACT ENUMERATION
+# =================================================================
+
+# Reference posterior-predictive curves:
+# key = (true_type_id, outcomes_tuple, method)
+reference_curve_lookup = {}
+
+approximation_rows = []
+candidate_grid_rows = []
+candidate_response_rows = []
+support_rows = []
+per_type_metric_rows = []
+paired_gain_rows = []
+runtime_rows = []
+
+# Reference must be processed first.
+processing_order = sorted(
+    APPROXIMATION_DEFINITIONS,
+    key=lambda item: (
+        not item["is_reference"],
+        item["n_capacity"] * item["n_lambda"],
+        item["phase"],
+    ),
+)
+
+print(
+    "Starting Version 06 exact enumeration.",
+    flush=True,
+)
+
+print(
+    f"True continuous workers: {TRUE_TYPE_COUNT}",
+    flush=True,
+)
+
+print(
+    f"Quadrature approximations: "
+    f"{len(APPROXIMATION_DEFINITIONS)}",
+    flush=True,
+)
+
+print(
+    f"Candidate-weighted progress units: "
+    f"{total_candidate_sequence_units:,}",
+    flush=True,
+)
+
+
+for approximation_number, definition in enumerate(
+    processing_order,
+    start=1,
+):
+    approximation_start = time.perf_counter()
+
+    approximation = build_approximation(definition)
+
+    approximation_name = definition["approximation"]
+    candidate_count = approximation["candidate_count"]
+
+    print(
+        f"\nBuilding/evaluating {approximation_name} "
+        f"({candidate_count} points)...",
+        flush=True,
+    )
+
+    approximation_rows.append(
+        {
+            "approximation": approximation_name,
+            "n_capacity": definition["n_capacity"],
+            "n_lambda": definition["n_lambda"],
+            "phase": definition["phase"],
+            "candidate_count": candidate_count,
+            "capacity_cell_width": approximation[
+                "capacity_cell_width"
+            ],
+            "lambda_cell_width": approximation[
+                "lambda_cell_width"
+            ],
+            "is_midpoint": bool(
+                np.isclose(definition["phase"], 0.5)
+            ),
+            "is_reference": definition["is_reference"],
+        }
+    )
+
+    for candidate_index in range(candidate_count):
+        candidate_grid_rows.append(
+            {
+                "approximation": approximation_name,
+                "candidate_index": candidate_index,
+                "capacity": float(
+                    approximation["capacity_vector"][
+                        candidate_index
+                    ]
+                ),
+                "lambda": float(
+                    approximation["lambda_vector"][
+                        candidate_index
+                    ]
+                ),
+                "prior_mass": float(
+                    approximation["prior"][
+                        candidate_index
+                    ]
+                ),
+            }
+        )
+
+    # Candidate behavior is saved for reproducibility.
+    for workload_index, workload in enumerate(ALL_WORKLOADS):
+        for candidate_index in range(candidate_count):
+            candidate_response_rows.append(
+                {
+                    "approximation": approximation_name,
+                    "candidate_index": candidate_index,
+                    "capacity": float(
+                        approximation["capacity_vector"][
+                            candidate_index
+                        ]
+                    ),
+                    "lambda": float(
+                        approximation["lambda_vector"][
+                            candidate_index
+                        ]
+                    ),
+                    "workload": float(workload),
+                    "optimal_effort": float(
+                        approximation["effort_matrix"][
+                            workload_index,
+                            candidate_index,
+                        ]
+                    ),
+                    "success_probability": float(
+                        approximation[
+                            "probability_matrix"
+                        ][
+                            workload_index,
+                            candidate_index,
+                        ]
+                    ),
+                }
+            )
+
+    candidate_training_probabilities = approximation[
+        "probability_matrix"
+    ][TRAINING_WORKLOAD_INDICES]
+
+    for true_number, true_row in true_types_df.iterrows():
+        current_true_type_id = true_row["true_type_id"]
+        true_data = true_runtime_data[
+            current_true_type_id
+        ]
+
+        true_training_efforts = true_data[
+            "training_efforts"
+        ]
+
+        true_training_probabilities = true_data[
+            "training_probabilities"
+        ]
+
+        true_curve = true_data["probability_curve"]
+
+        support_masks = {
+            "outcome_only": np.ones(
+                candidate_count,
+                dtype=bool,
+            )
+        }
+
+        support_sizes_by_method = {
+            "outcome_only": [candidate_count]
+        }
+
+        for method_name, monitored_rounds in (
+            MONITOR_SCHEDULES.items()
+        ):
+            support_mask, sizes_by_round = (
+                exact_effort_support_mask(
+                    approximation["effort_matrix"],
+                    true_training_efforts,
+                    monitored_rounds,
+                )
+            )
+
+            support_masks[method_name] = support_mask
+            support_sizes_by_method[
+                method_name
+            ] = sizes_by_round
+
+        for method_name in METHOD_NAMES:
+            support_size = int(
+                np.sum(support_masks[method_name])
+            )
+
+            support_rows.append(
+                {
+                    "approximation": approximation_name,
+                    "candidate_count": candidate_count,
+                    "phase": definition["phase"],
+                    "true_type_id": current_true_type_id,
+                    "true_capacity": float(
+                        true_row["true_capacity"]
+                    ),
+                    "true_lambda": float(
+                        true_row["true_lambda"]
+                    ),
+                    "method": method_name,
+                    "monitored_rounds": (
+                        ""
+                        if method_name == "outcome_only"
+                        else "|".join(
+                            str(value)
+                            for value in (
+                                MONITOR_SCHEDULES[
+                                    method_name
+                                ]
+                            )
+                        )
+                    ),
+                    "monitored_workloads": (
+                        ""
+                        if method_name == "outcome_only"
+                        else "|".join(
+                            str(
+                                int(
+                                    TRAINING_WORKLOAD_SEQUENCE[
+                                        value - 1
+                                    ]
+                                )
+                            )
+                            for value in (
+                                MONITOR_SCHEDULES[
+                                    method_name
+                                ]
+                            )
+                        )
+                    ),
+                    "support_size": support_size,
+                    "support_fraction": (
+                        support_size / candidate_count
+                    ),
+                    "support_collapsed": (
+                        support_size == 0
+                    ),
+                    "support_sizes_by_observation": (
+                        "|".join(
+                            str(value)
+                            for value in (
+                                support_sizes_by_method[
+                                    method_name
+                                ]
+                            )
+                        )
+                    ),
+                }
+            )
+
+        valid_method = {
+            method_name: bool(
+                np.any(support_masks[method_name])
+            )
+            for method_name in METHOD_NAMES
+        }
+
+        # The high-resolution reference should support every true worker.
+        if definition["is_reference"]:
+            for method_name in [
+                "exact_spread2",
+                "exact_unique3",
+            ]:
+                assert valid_method[method_name], (
+                    "Reference approximation collapsed for "
+                    f"{current_true_type_id}, {method_name}."
+                )
+
+        metric_sums = {
+            method_name: defaultdict(float)
+            for method_name in METHOD_NAMES
+        }
+
+        method_probability_mass = {
+            method_name: 0.0
+            for method_name in METHOD_NAMES
+        }
+
+        paired_sums = {
+            method_name: defaultdict(float)
+            for method_name in [
+                "exact_spread2",
+                "exact_unique3",
+            ]
+        }
+
+        positive_sequence_count = 0
+        enumerated_probability_mass = 0.0
+
+        for outcomes in product(
+            [0, 1],
+            repeat=HORIZON,
+        ):
+            sequence_weight = sequence_probability(
+                outcomes,
+                true_training_probabilities,
+            )
+
+            progress_tracker.update(
+                units=candidate_count,
+                context=(
+                    f"{approximation_name}, "
+                    f"true {true_number + 1}/"
+                    f"{TRUE_TYPE_COUNT}"
+                ),
+            )
+
+            if (
+                sequence_weight
+                <= SEQUENCE_PROBABILITY_SKIP
+            ):
+                continue
+
+            positive_sequence_count += 1
+            enumerated_probability_mass += (
+                sequence_weight
+            )
+
+            outcome_log_likelihood = (
+                candidate_outcome_log_likelihood(
+                    candidate_training_probabilities,
+                    outcomes,
+                )
+            )
+
+            sequence_metric_lookup = {}
+
+            for method_name in METHOD_NAMES:
+                if not valid_method[method_name]:
+                    continue
+
+                log_weights = (
+                    approximation["log_prior"]
+                    + outcome_log_likelihood
+                )
+
+                if method_name != "outcome_only":
+                    log_weights = log_weights.copy()
+                    log_weights[
+                        ~support_masks[method_name]
+                    ] = -np.inf
+
+                posterior = normalize_log_weights(
+                    log_weights
+                )
+
+                if posterior is None:
+                    raise RuntimeError(
+                        "Unexpected posterior collapse after "
+                        "support precheck."
+                    )
+
+                predicted_curve = (
+                    approximation[
+                        "probability_matrix"
+                    ]
+                    @ posterior
+                )
+
+                metrics = compute_predictive_metrics(
+                    posterior=posterior,
+                    predicted_curve=predicted_curve,
+                    true_curve=true_curve,
+                    capacity_vector=approximation[
+                        "capacity_vector"
+                    ],
+                    lambda_vector=approximation[
+                        "lambda_vector"
+                    ],
+                    true_capacity=float(
+                        true_row["true_capacity"]
+                    ),
+                    true_lambda=float(
+                        true_row["true_lambda"]
+                    ),
+                )
+
+                reference_key = (
+                    current_true_type_id,
+                    tuple(outcomes),
+                    method_name,
+                )
+
+                if definition["is_reference"]:
+                    reference_curve_lookup[
+                        reference_key
+                    ] = predicted_curve.copy()
+
+                    metrics[
+                        "reference_all_curve_rmse"
+                    ] = 0.0
+
+                    metrics[
+                        "reference_heldout_near_curve_rmse"
+                    ] = 0.0
+
+                    metrics[
+                        "reference_heldout_full_curve_rmse"
+                    ] = 0.0
+                else:
+                    reference_curve = (
+                        reference_curve_lookup[
+                            reference_key
+                        ]
+                    )
+
+                    all_difference = (
+                        predicted_curve
+                        - reference_curve
+                    )
+
+                    near_indices = EVALUATION_INDICES[
+                        "heldout_near"
+                    ]
+
+                    full_indices = EVALUATION_INDICES[
+                        "heldout_full"
+                    ]
+
+                    metrics[
+                        "reference_all_curve_rmse"
+                    ] = float(
+                        np.sqrt(
+                            np.mean(
+                                all_difference**2
+                            )
+                        )
+                    )
+
+                    metrics[
+                        "reference_heldout_near_curve_rmse"
+                    ] = float(
+                        np.sqrt(
+                            np.mean(
+                                all_difference[
+                                    near_indices
+                                ] ** 2
+                            )
+                        )
+                    )
+
+                    metrics[
+                        "reference_heldout_full_curve_rmse"
+                    ] = float(
+                        np.sqrt(
+                            np.mean(
+                                all_difference[
+                                    full_indices
+                                ] ** 2
+                            )
+                        )
+                    )
+
+                sequence_metric_lookup[
+                    method_name
+                ] = metrics
+
+                method_probability_mass[
+                    method_name
+                ] += sequence_weight
+
+                for metric_name, metric_value in (
+                    metrics.items()
+                ):
+                    metric_sums[
+                        method_name
+                    ][metric_name] += (
+                        sequence_weight
+                        * metric_value
+                    )
+
+            baseline_metrics = (
+                sequence_metric_lookup[
+                    "outcome_only"
+                ]
+            )
+
+            for method_name in [
+                "exact_spread2",
+                "exact_unique3",
+            ]:
+                if not valid_method[method_name]:
+                    continue
+
+                method_metrics = (
+                    sequence_metric_lookup[
+                        method_name
+                    ]
+                )
+
+                for metric_name in [
+                    "heldout_near_rmse",
+                    "heldout_near_mean_kl",
+                    "heldout_full_rmse",
+                    "all_workloads_rmse",
+                ]:
+                    improvement = (
+                        baseline_metrics[metric_name]
+                        - method_metrics[metric_name]
+                    )
+
+                    paired_sums[
+                        method_name
+                    ][
+                        f"{metric_name}_expected_improvement"
+                    ] += (
+                        sequence_weight
+                        * improvement
+                    )
+
+                    if improvement > METRIC_TIE_TOL:
+                        paired_sums[
+                            method_name
+                        ][
+                            f"{metric_name}_probability_better"
+                        ] += sequence_weight
+                    elif improvement < -METRIC_TIE_TOL:
+                        paired_sums[
+                            method_name
+                        ][
+                            f"{metric_name}_probability_worse"
+                        ] += sequence_weight
+                    else:
+                        paired_sums[
+                            method_name
+                        ][
+                            f"{metric_name}_probability_tie"
+                        ] += sequence_weight
+
+        assert np.isclose(
+            enumerated_probability_mass,
+            1.0,
+            atol=1e-10,
+        ), (
+            "Outcome-sequence probability mass did not "
+            "sum to one."
+        )
+
+        for method_name in METHOD_NAMES:
+            is_valid = valid_method[method_name]
+
+            row = {
+                "approximation": approximation_name,
+                "candidate_count": candidate_count,
+                "phase": definition["phase"],
+                "is_reference": definition[
+                    "is_reference"
+                ],
+                "true_type_id": current_true_type_id,
+                "true_capacity": float(
+                    true_row["true_capacity"]
+                ),
+                "true_lambda": float(
+                    true_row["true_lambda"]
+                ),
+                "method": method_name,
+                "numerically_valid": is_valid,
+                "support_collapsed": (
+                    not is_valid
+                ),
+                "positive_sequence_count": (
+                    positive_sequence_count
+                ),
+                "enumerated_probability_mass": (
+                    enumerated_probability_mass
+                ),
+            }
+
+            if is_valid:
+                assert np.isclose(
+                    method_probability_mass[
+                        method_name
+                    ],
+                    1.0,
+                    atol=1e-10,
+                )
+
+                for metric_name, weighted_sum in (
+                    metric_sums[
+                        method_name
+                    ].items()
+                ):
+                    row[metric_name] = weighted_sum
+            else:
+                # Metric columns are filled with NaN after all rows are built.
+                pass
+
+            per_type_metric_rows.append(row)
+
+        for method_name in [
+            "exact_spread2",
+            "exact_unique3",
+        ]:
+            is_valid = valid_method[method_name]
+
+            pair_row = {
+                "approximation": approximation_name,
+                "candidate_count": candidate_count,
+                "phase": definition["phase"],
+                "true_type_id": current_true_type_id,
+                "true_capacity": float(
+                    true_row["true_capacity"]
+                ),
+                "true_lambda": float(
+                    true_row["true_lambda"]
+                ),
+                "method": method_name,
+                "numerically_valid": is_valid,
+                "support_collapsed": (
+                    not is_valid
+                ),
+            }
+
+            if is_valid:
+                for key, value in paired_sums[
+                    method_name
+                ].items():
+                    pair_row[key] = value
+
+            paired_gain_rows.append(pair_row)
+
+    elapsed = time.perf_counter() - approximation_start
+
+    approximate_array_bytes = (
+        approximation["effort_matrix"].nbytes
+        + approximation[
+            "probability_matrix"
+        ].nbytes
+        + approximation[
+            "utility_matrix"
+        ].nbytes
+        + approximation[
+            "capacity_vector"
+        ].nbytes
+        + approximation[
+            "lambda_vector"
+        ].nbytes
+        + approximation["prior"].nbytes
+    )
+
+    runtime_rows.append(
+        {
+            "approximation": approximation_name,
+            "candidate_count": candidate_count,
+            "phase": definition["phase"],
+            "runtime_seconds": elapsed,
+            "runtime_minutes": elapsed / 60.0,
+            "approximate_array_memory_bytes": (
+                approximate_array_bytes
+            ),
+            "approximate_array_memory_mb": (
+                approximate_array_bytes
+                / (1024.0**2)
+            ),
+        }
+    )
+
+    # Release large approximation arrays before constructing the next grid.
+    del approximation
+
+
+progress_tracker.update(
+    units=max(
+        0.0,
+        total_candidate_sequence_units
+        - progress_tracker.completed_units,
+    )
+)
+
+print(
+    "\nExact enumeration complete.",
+    flush=True,
+)
+
+
+# =================================================================
+# 12. RAW TABLES
+# =================================================================
+
+approximations_df = pd.DataFrame(
+    approximation_rows
+).sort_values(
+    [
+        "candidate_count",
+        "phase",
+    ]
+)
+
+candidate_grids_df = pd.DataFrame(
+    candidate_grid_rows
+)
+
+candidate_responses_df = pd.DataFrame(
+    candidate_response_rows
+)
+
+support_by_type_df = pd.DataFrame(
+    support_rows
+)
+
+metrics_by_type_df = pd.DataFrame(
+    per_type_metric_rows
+)
+
+paired_gains_by_type_df = pd.DataFrame(
+    paired_gain_rows
+)
+
+runtime_df = pd.DataFrame(
+    runtime_rows
+).sort_values(
+    [
+        "candidate_count",
+        "phase",
+    ]
+)
+
+
+# =================================================================
+# 13. SUPPORT AGGREGATION
+# =================================================================
+
+support_aggregate_df = (
+    support_by_type_df.groupby(
+        [
+            "approximation",
+            "candidate_count",
+            "phase",
+            "method",
+        ],
+        as_index=False,
+    )
+    .agg(
+        support_collapse_rate=(
+            "support_collapsed",
+            "mean",
+        ),
+        valid_true_type_count=(
+            "support_collapsed",
+            lambda values: int(
+                np.sum(~values)
+            ),
+        ),
+        collapsed_true_type_count=(
+            "support_collapsed",
+            "sum",
+        ),
+        mean_support_size=(
+            "support_size",
+            "mean",
+        ),
+        median_support_size=(
+            "support_size",
+            "median",
+        ),
+        minimum_support_size=(
+            "support_size",
+            "min",
+        ),
+        maximum_support_size=(
+            "support_size",
+            "max",
+        ),
+        mean_support_fraction=(
+            "support_fraction",
+            "mean",
+        ),
+    )
+)
+
+
+# =================================================================
+# 14. METRIC AGGREGATION
+# =================================================================
+
+metric_columns = [
+    column
+    for column in metrics_by_type_df.columns
+    if column
+    not in {
+        "approximation",
+        "candidate_count",
+        "phase",
+        "is_reference",
+        "true_type_id",
+        "true_capacity",
+        "true_lambda",
+        "method",
+        "numerically_valid",
+        "support_collapsed",
+        "positive_sequence_count",
+        "enumerated_probability_mass",
+    }
+]
+
+valid_metrics_df = metrics_by_type_df[
+    metrics_by_type_df["numerically_valid"]
+].copy()
+
+aggregate_metrics_df = (
+    valid_metrics_df.groupby(
+        [
+            "approximation",
+            "candidate_count",
+            "phase",
+            "is_reference",
+            "method",
+        ],
+        as_index=False,
+    )[metric_columns]
+    .mean()
+)
+
+aggregate_metrics_df = aggregate_metrics_df.merge(
+    support_aggregate_df[
+        [
+            "approximation",
+            "method",
+            "support_collapse_rate",
+            "valid_true_type_count",
+            "collapsed_true_type_count",
+        ]
+    ],
+    on=[
+        "approximation",
+        "method",
+    ],
+    how="left",
+)
+
+aggregate_metrics_df[
+    "valid_true_type_fraction"
+] = (
+    aggregate_metrics_df[
+        "valid_true_type_count"
+    ]
+    / TRUE_TYPE_COUNT
+)
+
+aggregate_metrics_df[
+    "penalized_heldout_near_rmse"
+] = (
+    aggregate_metrics_df[
+        "heldout_near_rmse"
+    ]
+    * aggregate_metrics_df[
+        "valid_true_type_fraction"
+    ]
+    + COLLAPSE_RMSE_PENALTY
+    * (
+        1.0
+        - aggregate_metrics_df[
+            "valid_true_type_fraction"
+        ]
+    )
+)
+
+
+# =================================================================
+# 15. PAIRED-GAIN AGGREGATION
+# =================================================================
+
+paired_metric_columns = [
+    column
+    for column in paired_gains_by_type_df.columns
+    if column
+    not in {
+        "approximation",
+        "candidate_count",
+        "phase",
+        "true_type_id",
+        "true_capacity",
+        "true_lambda",
+        "method",
+        "numerically_valid",
+        "support_collapsed",
+    }
+]
+
+valid_paired_df = paired_gains_by_type_df[
+    paired_gains_by_type_df[
+        "numerically_valid"
+    ]
+].copy()
+
+paired_gains_aggregate_df = (
+    valid_paired_df.groupby(
+        [
+            "approximation",
+            "candidate_count",
+            "phase",
+            "method",
+        ],
+        as_index=False,
+    )[paired_metric_columns]
+    .mean()
+)
+
+paired_gains_aggregate_df = (
+    paired_gains_aggregate_df.merge(
+        support_aggregate_df[
+            [
+                "approximation",
+                "method",
+                "support_collapse_rate",
+                "valid_true_type_count",
+            ]
+        ],
+        on=[
+            "approximation",
+            "method",
+        ],
+        how="left",
+    )
+)
+
+
+# =================================================================
+# 16. CONVERGENCE TO REFERENCE
+# =================================================================
+
+reference_aggregate = aggregate_metrics_df[
+    aggregate_metrics_df[
+        "approximation"
+    ] == REFERENCE_APPROXIMATION
+][
+    [
+        "method",
+        "heldout_near_rmse",
+        "heldout_full_rmse",
+        "all_workloads_rmse",
+    ]
+].rename(
+    columns={
+        "heldout_near_rmse": (
+            "reference_aggregate_heldout_near_rmse"
+        ),
+        "heldout_full_rmse": (
+            "reference_aggregate_heldout_full_rmse"
+        ),
+        "all_workloads_rmse": (
+            "reference_aggregate_all_workloads_rmse"
+        ),
+    }
+)
+
+convergence_summary_df = aggregate_metrics_df.merge(
+    reference_aggregate,
+    on="method",
+    how="left",
+)
+
+convergence_summary_df[
+    "absolute_aggregate_heldout_near_rmse_difference"
+] = np.abs(
+    convergence_summary_df[
+        "heldout_near_rmse"
+    ]
+    - convergence_summary_df[
+        "reference_aggregate_heldout_near_rmse"
+    ]
+)
+
+convergence_summary_df[
+    "absolute_aggregate_heldout_full_rmse_difference"
+] = np.abs(
+    convergence_summary_df[
+        "heldout_full_rmse"
+    ]
+    - convergence_summary_df[
+        "reference_aggregate_heldout_full_rmse"
+    ]
+)
+
+convergence_summary_df[
+    "zero_support_collapse"
+] = np.isclose(
+    convergence_summary_df[
+        "support_collapse_rate"
+    ],
+    0.0,
+)
+
+convergence_summary_df[
+    "reference_curve_tolerance_pass"
+] = (
+    convergence_summary_df[
+        "reference_heldout_near_curve_rmse"
+    ]
+    <= REFERENCE_CURVE_RMSE_TOLERANCE
+)
+
+convergence_summary_df[
+    "aggregate_rmse_tolerance_pass"
+] = (
+    convergence_summary_df[
+        "absolute_aggregate_heldout_near_rmse_difference"
+    ]
+    <= AGGREGATE_RMSE_DIFFERENCE_TOLERANCE
+)
+
+convergence_summary_df[
+    "basic_convergence_pass"
+] = (
+    convergence_summary_df[
+        "zero_support_collapse"
+    ]
+    & convergence_summary_df[
+        "reference_curve_tolerance_pass"
+    ]
+    & convergence_summary_df[
+        "aggregate_rmse_tolerance_pass"
+    ]
+)
+
+
+# =================================================================
+# 17. PHASE-SHIFT SENSITIVITY
+# =================================================================
+
+phase_sensitivity_rows = []
+
+for grid_size in [17, 33]:
+    relevant_approximations = approximations_df[
+        approximations_df["n_capacity"]
+        == grid_size
+    ]["approximation"].tolist()
+
+    for method_name in METHOD_NAMES:
+        subset = convergence_summary_df[
+            (
+                convergence_summary_df[
+                    "approximation"
+                ].isin(relevant_approximations)
+            )
+            & (
+                convergence_summary_df[
+                    "method"
+                ] == method_name
+            )
+        ].copy()
+
+        paired_subset = paired_gains_aggregate_df[
+            (
+                paired_gains_aggregate_df[
+                    "approximation"
+                ].isin(relevant_approximations)
+            )
+            & (
+                paired_gains_aggregate_df[
+                    "method"
+                ] == method_name
+            )
+        ].copy()
+
+        if subset.empty:
+            continue
+
+        row = {
+            "grid_size_per_dimension": grid_size,
+            "candidate_count": grid_size**2,
+            "method": method_name,
+            "phase_count": len(subset),
+            "phases": "|".join(
+                f"{value:.2f}"
+                for value in sorted(
+                    subset["phase"].tolist()
+                )
+            ),
+            "heldout_near_rmse_min": float(
+                subset[
+                    "heldout_near_rmse"
+                ].min()
+            ),
+            "heldout_near_rmse_max": float(
+                subset[
+                    "heldout_near_rmse"
+                ].max()
+            ),
+            "heldout_near_rmse_phase_range": float(
+                subset[
+                    "heldout_near_rmse"
+                ].max()
+                - subset[
+                    "heldout_near_rmse"
+                ].min()
+            ),
+            "reference_curve_rmse_phase_range": float(
+                subset[
+                    "reference_heldout_near_curve_rmse"
+                ].max()
+                - subset[
+                    "reference_heldout_near_curve_rmse"
+                ].min()
+            ),
+            "support_collapse_rate_max": float(
+                subset[
+                    "support_collapse_rate"
+                ].max()
+            ),
+        }
+
+        if not paired_subset.empty:
+            improvement_column = (
+                "heldout_near_rmse_"
+                "expected_improvement"
+            )
+
+            row[
+                "paired_improvement_min"
+            ] = float(
+                paired_subset[
+                    improvement_column
+                ].min()
+            )
+
+            row[
+                "paired_improvement_max"
+            ] = float(
+                paired_subset[
+                    improvement_column
+                ].max()
+            )
+
+            row[
+                "paired_improvement_phase_range"
+            ] = float(
+                paired_subset[
+                    improvement_column
+                ].max()
+                - paired_subset[
+                    improvement_column
+                ].min()
+            )
+
+        row["phase_tolerance_pass"] = bool(
+            row[
+                "heldout_near_rmse_phase_range"
+            ]
+            <= PHASE_RANGE_TOLERANCE
+        )
+
+        phase_sensitivity_rows.append(row)
+
+phase_sensitivity_df = pd.DataFrame(
+    phase_sensitivity_rows
+)
+
+
+# =================================================================
+# 18. MIDPOINT CONVERGENCE TABLE
+# =================================================================
+
+midpoint_convergence_df = (
+    convergence_summary_df[
+        np.isclose(
+            convergence_summary_df["phase"],
+            0.5,
+        )
+    ]
+    .copy()
+    .sort_values(
+        [
+            "method",
+            "candidate_count",
+        ]
+    )
+)
+
+# Add phase stability to 17x17 and 33x33 midpoint rows.
+phase_pass_lookup = {
+    (
+        int(row["candidate_count"]),
+        row["method"],
+    ): bool(row["phase_tolerance_pass"])
+    for _, row in phase_sensitivity_df.iterrows()
+}
+
+midpoint_convergence_df[
+    "phase_tolerance_pass"
+] = midpoint_convergence_df.apply(
+    lambda row: (
+        True
+        if int(row["candidate_count"])
+        not in {17**2, 33**2}
+        else phase_pass_lookup[
+            (
+                int(row["candidate_count"]),
+                row["method"],
+            )
+        ]
+    ),
+    axis=1,
+)
+
+midpoint_convergence_df[
+    "full_numerical_screen_pass"
+] = (
+    midpoint_convergence_df[
+        "basic_convergence_pass"
+    ]
+    & midpoint_convergence_df[
+        "phase_tolerance_pass"
+    ]
+)
+
+
+# =================================================================
+# 19. SELECTED FINE-GRID TYPE-LEVEL GAINS
+# =================================================================
+
+selected_fine_name = "fine_17_midpoint"
+
+selected_fine_gains_df = paired_gains_by_type_df[
+    (
+        paired_gains_by_type_df[
+            "approximation"
+        ] == selected_fine_name
+    )
+    & (
+        paired_gains_by_type_df[
+            "method"
+        ] == "exact_spread2"
+    )
+].copy().sort_values(
+    "heldout_near_rmse_expected_improvement",
+    ascending=False,
+)
+
+
+# =================================================================
+# 20. SAVE TABLES
+# =================================================================
+
+csv_tables = {
+    "01_approximations.csv": approximations_df,
+    "02_true_continuous_types.csv": true_types_df,
+    "03_true_type_node_coincidence_check.csv": (
+        node_coincidence_df
+    ),
+    "04_candidate_quadrature_points.csv": (
+        candidate_grids_df
+    ),
+    "05_candidate_workload_responses.csv": (
+        candidate_responses_df
+    ),
+    "06_support_by_true_type.csv": (
+        support_by_type_df
+    ),
+    "07_support_aggregate.csv": (
+        support_aggregate_df
+    ),
+    "08_expected_final_metrics_by_true_type.csv": (
+        metrics_by_type_df
+    ),
+    "09_aggregate_expected_metrics.csv": (
+        aggregate_metrics_df
+    ),
+    "10_paired_gains_by_true_type.csv": (
+        paired_gains_by_type_df
+    ),
+    "11_paired_gains_aggregate.csv": (
+        paired_gains_aggregate_df
+    ),
+    "12_convergence_summary.csv": (
+        convergence_summary_df
+    ),
+    "13_phase_shift_sensitivity.csv": (
+        phase_sensitivity_df
+    ),
+    "14_midpoint_convergence_screen.csv": (
+        midpoint_convergence_df
+    ),
+    "15_selected_fine_grid_type_gains.csv": (
+        selected_fine_gains_df
+    ),
+    "16_runtime_and_memory.csv": runtime_df,
+}
+
+for filename, dataframe in csv_tables.items():
+    dataframe.to_csv(
+        OUTPUT_DIR / filename,
+        index=False,
+    )
+
+
+# =================================================================
+# 21. SAVE CONFIGURATION
+# =================================================================
+
+configuration = {
+    "script_label": SCRIPT_LABEL,
+    "beta": BETA,
+    "payment_per_unit": PAYMENT_PER_UNIT,
+    "effort_step": EFFORT_STEP,
+    "effort_grid": EFFORT_GRID.tolist(),
+    "capacity_domain": [
+        CAPACITY_MIN,
+        CAPACITY_MAX,
+    ],
+    "lambda_domain": [
+        LAMBDA_MIN,
+        LAMBDA_MAX,
+    ],
+    "all_workloads": ALL_WORKLOADS.tolist(),
+    "training_workload_sequence": (
+        TRAINING_WORKLOAD_SEQUENCE.tolist()
+    ),
+    "heldout_near_workloads": (
+        HELDOUT_NEAR_WORKLOADS.tolist()
+    ),
+    "heldout_full_workloads": (
+        HELDOUT_FULL_WORKLOADS.tolist()
+    ),
+    "monitor_schedules": MONITOR_SCHEDULES,
+    "methods": METHOD_NAMES,
+    "approximation_definitions": (
+        APPROXIMATION_DEFINITIONS
+    ),
+    "reference_approximation": (
+        REFERENCE_APPROXIMATION
+    ),
+    "true_capacity_values": (
+        TRUE_CAPACITY_VALUES.tolist()
+    ),
+    "true_lambda_values": (
+        TRUE_LAMBDA_VALUES.tolist()
+    ),
+    "argmax_tolerance": ARGMAX_TOL,
+    "probability_clip": PROBABILITY_CLIP,
+    "sequence_probability_skip": (
+        SEQUENCE_PROBABILITY_SKIP
+    ),
+    "metric_tie_tolerance": (
+        METRIC_TIE_TOL
+    ),
+    "collapse_rmse_penalty": (
+        COLLAPSE_RMSE_PENALTY
+    ),
+    "reference_curve_rmse_tolerance": (
+        REFERENCE_CURVE_RMSE_TOLERANCE
+    ),
+    "aggregate_rmse_difference_tolerance": (
+        AGGREGATE_RMSE_DIFFERENCE_TOLERANCE
+    ),
+    "phase_range_tolerance": (
+        PHASE_RANGE_TOLERANCE
+    ),
+    "random_seed": None,
+    "outcome_enumeration": "exact",
+}
+
+with open(
+    OUTPUT_DIR / "00_configuration.json",
+    "w",
+    encoding="utf-8",
+) as file:
+    json.dump(
+        configuration,
+        file,
+        indent=2,
+    )
+
+
+# =================================================================
+# 22. FIGURES
+# =================================================================
+
+midpoint_names_by_count = (
+    approximations_df[
+        approximations_df["is_midpoint"]
+    ]
+    .sort_values("candidate_count")
+)
+
+# Figure 1: support-collapse rate by midpoint grid size.
+plt.figure(figsize=(9, 6))
+
+for method_name in [
+    "exact_spread2",
+    "exact_unique3",
+]:
+    subset = support_aggregate_df[
+        (
+            support_aggregate_df[
+                "approximation"
+            ].isin(
+                midpoint_names_by_count[
+                    "approximation"
+                ]
+            )
+        )
+        & (
+            support_aggregate_df[
+                "method"
+            ] == method_name
+        )
+    ].sort_values("candidate_count")
+
+    plt.plot(
+        subset["candidate_count"],
+        subset["support_collapse_rate"],
+        marker="o",
+        label=method_name,
+    )
+
+plt.xscale("log")
+plt.xlabel("Quadrature points")
+plt.ylabel("Support-collapse rate")
+plt.title("Exact Effort Support Collapse Versus Grid Resolution")
+plt.ylim(-0.02, 1.02)
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_01_support_collapse.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 2: predictive RMSE by midpoint grid size.
+plt.figure(figsize=(9, 6))
+
+for method_name in METHOD_NAMES:
+    subset = midpoint_convergence_df[
+        midpoint_convergence_df[
+            "method"
+        ] == method_name
+    ].sort_values("candidate_count")
+
+    plt.plot(
+        subset["candidate_count"],
+        subset["heldout_near_rmse"],
+        marker="o",
+        label=method_name,
+    )
+
+plt.xscale("log")
+plt.xlabel("Quadrature points")
+plt.ylabel("Expected held-out-near RMSE")
+plt.title("Predictive Accuracy Versus Continuous-Posterior Resolution")
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_02_predictive_rmse_convergence.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 3: posterior-predictive difference from reference.
+plt.figure(figsize=(9, 6))
+
+for method_name in METHOD_NAMES:
+    subset = midpoint_convergence_df[
+        midpoint_convergence_df[
+            "method"
+        ] == method_name
+    ].sort_values("candidate_count")
+
+    plt.plot(
+        subset["candidate_count"],
+        subset[
+            "reference_heldout_near_curve_rmse"
+        ],
+        marker="o",
+        label=method_name,
+    )
+
+plt.axhline(
+    REFERENCE_CURVE_RMSE_TOLERANCE,
+    linestyle="--",
+    label="provisional tolerance",
+)
+plt.xscale("log")
+plt.xlabel("Quadrature points")
+plt.ylabel("RMSE from reference posterior-predictive curve")
+plt.title("Convergence Toward 4225-Point Reference")
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_03_reference_curve_convergence.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 4: phase sensitivity.
+phase_plot = convergence_summary_df[
+    convergence_summary_df[
+        "candidate_count"
+    ].isin([17**2, 33**2])
+].copy()
+
+plt.figure(figsize=(10, 6))
+
+for candidate_count in [17**2, 33**2]:
+    for method_name in METHOD_NAMES:
+        subset = phase_plot[
+            (
+                phase_plot[
+                    "candidate_count"
+                ] == candidate_count
+            )
+            & (
+                phase_plot["method"]
+                == method_name
+            )
+        ].sort_values("phase")
+
+        plt.plot(
+            subset["phase"],
+            subset["heldout_near_rmse"],
+            marker="o",
+            label=(
+                f"{candidate_count} points, "
+                f"{method_name}"
+            ),
+        )
+
+plt.xlabel("Within-cell quadrature phase")
+plt.ylabel("Expected held-out-near RMSE")
+plt.title("Sensitivity to Shifting Quadrature Points")
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_04_phase_shift_sensitivity.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 5: effort-aware improvement over outcome-only.
+plt.figure(figsize=(9, 6))
+
+for method_name in [
+    "exact_spread2",
+    "exact_unique3",
+]:
+    subset = paired_gains_aggregate_df[
+        (
+            paired_gains_aggregate_df[
+                "approximation"
+            ].isin(
+                midpoint_names_by_count[
+                    "approximation"
+                ]
+            )
+        )
+        & (
+            paired_gains_aggregate_df[
+                "method"
+            ] == method_name
+        )
+    ].sort_values("candidate_count")
+
+    plt.plot(
+        subset["candidate_count"],
+        subset[
+            "heldout_near_rmse_"
+            "expected_improvement"
+        ],
+        marker="o",
+        label=method_name,
+    )
+
+plt.axhline(
+    0.0,
+    linestyle="--",
+)
+plt.xscale("log")
+plt.xlabel("Quadrature points")
+plt.ylabel("Expected RMSE improvement over outcome-only")
+plt.title("Predictive Value of Exact Effort Observations")
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_05_effort_gain_convergence.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 6: runtime.
+plt.figure(figsize=(9, 6))
+plt.scatter(
+    runtime_df["candidate_count"],
+    runtime_df["runtime_seconds"],
+    s=70,
+)
+
+for _, row in runtime_df.iterrows():
+    plt.annotate(
+        row["approximation"],
+        (
+            row["candidate_count"],
+            row["runtime_seconds"],
+        ),
+        fontsize=7,
+        xytext=(4, 3),
+        textcoords="offset points",
+    )
+
+plt.xscale("log")
+plt.xlabel("Quadrature points")
+plt.ylabel("Runtime in seconds")
+plt.title("Runtime Scaling")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_06_runtime_scaling.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 7: per-type gain heatmap for selected fine grid.
+heatmap_source = selected_fine_gains_df.pivot(
+    index="true_lambda",
+    columns="true_capacity",
+    values=(
+        "heldout_near_rmse_"
+        "expected_improvement"
+    ),
+).sort_index()
+
+plt.figure(figsize=(8, 6))
+image = plt.imshow(
+    heatmap_source.to_numpy(dtype=float),
+    aspect="auto",
+    interpolation="nearest",
+)
+plt.colorbar(
+    image,
+    label="Expected RMSE improvement over outcome-only",
+)
+plt.xticks(
+    np.arange(len(heatmap_source.columns)),
+    [
+        f"{value:.2f}"
+        for value in heatmap_source.columns
+    ],
+)
+plt.yticks(
+    np.arange(len(heatmap_source.index)),
+    [
+        f"{value:.2f}"
+        for value in heatmap_source.index
+    ],
+)
+plt.xlabel("True continuous capacity C")
+plt.ylabel("True continuous resource aversion lambda")
+plt.title("Fine-Grid Effort Benefit by True Worker")
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_07_fine_grid_gain_heatmap.png",
+    dpi=200,
+)
+plt.show()
+
+
+# =================================================================
+# 23. AUTOMATIC SUMMARY
+# =================================================================
+
+summary_lines = [
+    "TASK 4 V06: CONTINUOUS-TYPE POSTERIOR CONVERGENCE AUDIT",
+    "=" * 74,
+    "",
+    "Conceptual model:",
+    (
+        f"  C continuous on [{CAPACITY_MIN}, {CAPACITY_MAX}]"
+    ),
+    (
+        f"  lambda continuous on "
+        f"[{LAMBDA_MIN}, {LAMBDA_MAX}]"
+    ),
+    (
+        "  effort discrete on "
+        "{0, 0.05, ..., 1.00}"
+    ),
+    "",
+    "Experiment:",
+    f"  Continuous true workers: {TRUE_TYPE_COUNT}",
+    (
+        "  Workload sequence: "
+        + str(
+            [
+                int(value)
+                for value in TRAINING_WORKLOAD_SEQUENCE
+            ]
+        )
+    ),
+    (
+        "  Outcome sequences per worker: "
+        f"{2 ** HORIZON}"
+    ),
+    (
+        "  Reference approximation: "
+        f"{REFERENCE_APPROXIMATION}"
+    ),
+    "",
+    "Midpoint-grid convergence:",
+]
+
+for method_name in METHOD_NAMES:
+    summary_lines.append(f"  {method_name}:")
+
+    subset = midpoint_convergence_df[
+        midpoint_convergence_df[
+            "method"
+        ] == method_name
+    ].sort_values("candidate_count")
+
+    for _, row in subset.iterrows():
+        summary_lines.append(
+            "    "
+            f"{int(row['candidate_count']):4d} points: "
+            f"collapse="
+            f"{row['support_collapse_rate']:.3f}, "
+            f"held-out RMSE="
+            f"{row['heldout_near_rmse']:.6f}, "
+            f"reference-curve RMSE="
+            f"{row['reference_heldout_near_curve_rmse']:.6f}, "
+            f"screen pass="
+            f"{bool(row['full_numerical_screen_pass'])}"
+        )
+
+summary_lines.extend(
+    [
+        "",
+        "Phase-shift sensitivity:",
+    ]
+)
+
+for _, row in phase_sensitivity_df.iterrows():
+    summary_lines.append(
+        "  "
+        f"{int(row['candidate_count'])} points, "
+        f"{row['method']}: "
+        f"RMSE range="
+        f"{row['heldout_near_rmse_phase_range']:.6f}, "
+        f"pass={bool(row['phase_tolerance_pass'])}"
+    )
+
+summary_lines.extend(
+    [
+        "",
+        "Interpretation cautions:",
+        (
+            "  - Quadrature points are numerical integration points, "
+            "not a finite catalogue of worker types."
+        ),
+        (
+            "  - Conditional predictive metrics exclude true workers "
+            "whose exact numerical support collapsed."
+        ),
+        (
+            "  - The penalized RMSE column assigns RMSE=1 to collapsed "
+            "cases and should be used when comparing coarse grids."
+        ),
+        (
+            "  - The 4225-point approximation is a numerical reference, "
+            "not an analytic ground truth."
+        ),
+        (
+            "  - This audit assumes deterministic workers and exact effort "
+            "observation. Genuine behavioral mismatch remains separate."
+        ),
+        (
+            "  - Monitoring cost, population transfer, allocation, and "
+            "multiple workers are intentionally excluded."
+        ),
+        "",
+        "Upload the complete ZIP package for joint interpretation.",
+    ]
+)
+
+summary_text = "\n".join(summary_lines)
+
+with open(
+    OUTPUT_DIR / "17_summary.txt",
+    "w",
+    encoding="utf-8",
+) as file:
+    file.write(summary_text)
+
+
+# =================================================================
+# 24. PRINT MAIN RESULTS
+# =================================================================
+
+pd.set_option("display.max_rows", 400)
+pd.set_option("display.max_columns", 150)
+pd.set_option("display.width", 250)
+pd.set_option(
+    "display.float_format",
+    lambda value: f"{value:0.6f}",
+)
+
+print("=" * 112)
+print("TASK 4 V06: CONTINUOUS-TYPE POSTERIOR CONVERGENCE AUDIT")
+print("=" * 112)
+print()
+print(summary_text)
+print()
+
+print("=" * 112)
+print("MIDPOINT CONVERGENCE SCREEN")
+print("=" * 112)
+display(
+    midpoint_convergence_df[
+        [
+            "approximation",
+            "candidate_count",
+            "method",
+            "support_collapse_rate",
+            "valid_true_type_count",
+            "heldout_near_rmse",
+            "penalized_heldout_near_rmse",
+            "heldout_near_mean_kl",
+            "reference_heldout_near_curve_rmse",
+            "absolute_aggregate_heldout_near_rmse_difference",
+            "phase_tolerance_pass",
+            "full_numerical_screen_pass",
+        ]
+    ].sort_values(
+        [
+            "method",
+            "candidate_count",
+        ]
+    )
+)
+
+print("=" * 112)
+print("PHASE-SHIFT SENSITIVITY")
+print("=" * 112)
+display(phase_sensitivity_df)
+
+print("=" * 112)
+print("PAIRED EFFORT GAINS")
+print("=" * 112)
+display(
+    paired_gains_aggregate_df[
+        [
+            "approximation",
+            "candidate_count",
+            "phase",
+            "method",
+            "support_collapse_rate",
+            "valid_true_type_count",
+            "heldout_near_rmse_expected_improvement",
+            "heldout_near_rmse_probability_better",
+            "heldout_near_rmse_probability_worse",
+            "heldout_near_rmse_probability_tie",
+        ]
+    ].sort_values(
+        [
+            "method",
+            "candidate_count",
+            "phase",
+        ]
+    )
+)
+
+print("=" * 112)
+print("RUNTIME AND MEMORY")
+print("=" * 112)
+display(runtime_df)
+
+print("=" * 112)
+print("SELECTED FINE-GRID PER-TYPE GAINS")
+print("=" * 112)
+display(selected_fine_gains_df)
+
+
+# =================================================================
+# 25. ZIP PACKAGE
+# =================================================================
+
+with zipfile.ZipFile(
+    ZIP_PATH,
+    mode="w",
+    compression=zipfile.ZIP_DEFLATED,
+) as zip_file:
+    for file_path in sorted(
+        OUTPUT_DIR.rglob("*")
+    ):
+        if file_path.is_file():
+            zip_file.write(
+                file_path,
+                arcname=file_path.relative_to(
+                    OUTPUT_DIR
+                ),
+            )
+
+print()
+print("=" * 112)
+print("OUTPUT PACKAGE CREATED")
+print("=" * 112)
+print(f"Output directory: {OUTPUT_DIR}")
+print(f"ZIP file:         {ZIP_PATH}")
+print(
+    f"ZIP size:         "
+    f"{ZIP_PATH.stat().st_size / 1024:.1f} KB"
+)
+print()
+print(
+    "Upload the complete ZIP file. It contains all numerical tables, "
+    "configuration, summary, and figures."
+)
+
+
+# =================================================================
+# 26. AUTOMATIC COLAB DOWNLOAD
+# =================================================================
+
+try:
+    from google.colab import files
+
+    files.download(str(ZIP_PATH))
+except ImportError:
+    print(
+        "Not running in Google Colab, so automatic download was skipped."
+    )
+except Exception as error:
+    print(
+        "Automatic download could not start. "
+        f"Download the ZIP manually from: {ZIP_PATH}"
+    )
+    print(f"Download error: {error}")

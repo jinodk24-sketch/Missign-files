@@ -1,0 +1,1795 @@
+# Task 4, Version 10d3: Signal-Model Misspecification Confirmation
+# =============================================================================
+#
+# PURPOSE
+# -------
+# This focused confirmation keeps the locked practical monitoring policy from
+# V10c4c fixed and tests whether it remains useful when the coordinator is wrong
+# about the reliability of effort behavior or the monitoring sensor.
+#
+# Two true environments are studied separately:
+#
+#   A. workers deviate to an adjacent effort mode with probability 30%,
+#   B. the monitoring sensor reports an adjacent effort mode with probability 30%.
+#
+# Within each true environment, the coordinator assumes the correct 30% rate,
+# underestimates it as 10%, or assumes perfect reliability (0%). The same paired
+# seeds are reused across the three assumptions, so the utility loss caused by
+# misspecification can be measured directly.
+#
+# LOCKED PRACTICAL POLICY
+# -----------------------
+# For each allocated worker i, after the current allocation is fixed, compute
+# the exact one-step individual EVSI under the coordinator's assumed model:
+#
+#   EVSI_1(i,t)
+#     = E[V_{t+1} | outcomes + monitored effort of i]
+#       - E[V_{t+1} | outcomes only].
+#
+# Monitor every worker satisfying:
+#
+#   EVSI_1(i,t) > c_m.
+#
+# There is no cumulative budget and multiple workers may be monitored in the
+# same round. Joint interaction effects between simultaneously observed workers
+# remain intentionally ignored, exactly as in the locked V10c4c algorithm.
+#
+# IMPORTANT MODELING DISTINCTIONS
+# -------------------------------
+# Behavioral misspecification:
+#   True workers sometimes choose an adjacent effort mode, while the coordinator
+#   may underestimate or ignore that randomness in both outcome and effort
+#   likelihoods.
+#
+# Measurement misspecification:
+#   Workers choose deterministic optimal effort, but the monitor may report an
+#   adjacent one of the 21 effort levels. The coordinator may underestimate or
+#   ignore this measurement error. No low/medium/high binning is used.
+#
+# DEFAULT RUN SIZE
+# ----------------
+# The confirmation uses 10 fresh paired seeds per condition. With six conditions,
+# the run contains 60 environment jobs. Based on V10d2 runtimes, this should be
+# roughly 15-25 minutes on a comparable Colab runtime.
+#
+# OUTPUTS
+# -------
+# The script creates configuration, condition definitions, round-level data,
+# monitoring events, EVSI candidate scores, posterior summaries, runtime,
+# condition summaries, paired misspecification comparisons, figures, a text
+# report, and a ZIP archive. In Google Colab the ZIP is downloaded automatically.
+#
+# Paste this entire file into one Google Colab cell and run it.
+
+import gc
+import itertools
+import json
+import math
+import os
+import shutil
+import time
+import zipfile
+from collections import OrderedDict
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import t as student_t_distribution
+
+try:
+    from IPython.display import display
+except ImportError:
+    def display(value):
+        print(value)
+
+
+# =============================================================================
+# 1. CONFIGURATION
+# =============================================================================
+
+SCRIPT_LABEL = "task4_v10d3_signal_model_misspecification_confirmation"
+BASE_RANDOM_SEED = 20282100
+REPLICATION_COUNT_PER_CONDITION = 10
+BOOTSTRAP_REPETITIONS = 5000
+BOOTSTRAP_SEED = 20282200
+
+WORKER_COUNT = 5
+TOTAL_WORKLOAD = 40
+ADAPTIVE_HORIZON = 25
+WARMUP_ROUNDS = 0
+
+PAYMENT_PER_UNIT = 1.0
+COORDINATOR_SUCCESS_VALUE = 2.0
+COORDINATOR_FAILURE_LOSS = 1.0
+
+# Locked coordinator assumptions.
+ASSUMED_BETA_BASELINE = 8.0
+ASSUMED_COST_POWER_BASELINE = 2.0
+EFFORT_STEP = 0.05
+EFFORT_GRID = np.round(np.arange(0.0, 1.0 + EFFORT_STEP / 2.0, EFFORT_STEP), 10)
+EFFORT_MODE_COUNT = len(EFFORT_GRID)
+
+# Locked monitoring cost from V10c4c. It is intentionally not retuned here.
+MONITORING_COST = 0.21927209143761273
+
+# Fixed fine global posterior grid validated in V10c4a/c4c.
+I_REFERENCE = 7.0
+PRIOR_MEDIAN_CAPACITY = 12.0
+PRIOR_MEDIAN_LAMBDA = 0.8
+PRIOR_DF = 3.0
+PRIOR_X_SCALE = 0.35
+PRIOR_Z_SCALE = 0.35
+GRID_MARGINAL_PRIOR_MASS = 0.995
+GRID_LOG_SPACING = 0.025
+
+# Tiny full-support floors are numerical safeguards, not coarse measurement.
+NUMERICAL_BEHAVIOR_FLOOR = 1e-8
+NUMERICAL_OBSERVATION_FLOOR = 1e-6
+PROBABILITY_CLIP = 1e-10
+SIGNAL_PROBABILITY_FLOOR = 1e-14
+NORMALIZATION_TOLERANCE = 2e-6
+NONNEGATIVITY_TOLERANCE = 1e-6
+ALLOCATION_TIE_TOL = 1e-12
+DECISION_TIE_TOL = 1e-12
+PAIRWISE_TIE_TOL = 1e-9
+
+# Bound the memory used by scenario-specific joint signal likelihoods.
+JOINT_CACHE_MAX_WORKLOADS = 12
+
+RESUME_FROM_CHECKPOINT = True
+DETAILED_ROUND_PROGRESS = False
+ROUND_HEARTBEAT_INTERVAL = 5
+
+# Set by environment variable only for the assistant's startup test. Normal
+# Colab execution leaves this False.
+SMOKE_TEST = os.environ.get("V10D3_SMOKE_TEST", "0") == "1"
+
+POLICY_NAMES = (
+    "outcome_only",
+    "monitor_on_arrival",
+    "uncertainty_proxy",
+    "individual_evsi",
+    "oracle_dynamic",
+)
+LEARNING_POLICY_NAMES = tuple(name for name in POLICY_NAMES if name != "oracle_dynamic")
+BASELINE_NAMES = ("outcome_only", "monitor_on_arrival", "uncertainty_proxy")
+
+WORKER_CATALOG = [
+    {"catalog_index": 0, "worker_id": "initial_1_strong", "role": "initial", "capacity": 18.5, "lambda": 0.55},
+    {"catalog_index": 1, "worker_id": "initial_2_medium", "role": "initial", "capacity": 12.3, "lambda": 0.82},
+    {"catalog_index": 2, "worker_id": "initial_3_highC_highL", "role": "initial", "capacity": 26.0, "lambda": 1.70},
+    {"catalog_index": 3, "worker_id": "initial_4_lowerC_lowerL", "role": "initial", "capacity": 8.5, "lambda": 0.55},
+    {"catalog_index": 4, "worker_id": "initial_5_giveup_ambiguous", "role": "initial", "capacity": 5.5, "lambda": 0.38},
+    {"catalog_index": 5, "worker_id": "replacement_1_lowC_highL", "role": "replacement", "capacity": 7.0, "lambda": 1.35},
+    {"catalog_index": 6, "worker_id": "replacement_2_elite", "role": "replacement", "capacity": 23.5, "lambda": 0.65},
+    {"catalog_index": 7, "worker_id": "replacement_3_lowcost_midC", "role": "replacement", "capacity": 11.0, "lambda": 0.32},
+    {"catalog_index": 8, "worker_id": "replacement_4_highC_veryhighL", "role": "replacement", "capacity": 27.5, "lambda": 2.10},
+    {"catalog_index": 9, "worker_id": "replacement_5_balanced", "role": "replacement", "capacity": 14.5, "lambda": 0.72},
+]
+INITIAL_ACTIVE_CATALOG_INDICES = (0, 1, 2, 3, 4)
+REPLACEMENT_EVENTS = (
+    {"adaptive_round": 5, "slot_index": 0, "new_catalog_index": 5},
+    {"adaptive_round": 9, "slot_index": 1, "new_catalog_index": 6},
+    {"adaptive_round": 13, "slot_index": 2, "new_catalog_index": 7},
+    {"adaptive_round": 17, "slot_index": 3, "new_catalog_index": 8},
+    {"adaptive_round": 21, "slot_index": 4, "new_catalog_index": 9},
+)
+
+# Signal-model misspecification conditions. Each true environment has a
+# correctly specified reference and two under-specified coordinator models.
+CONDITIONS = [
+    {
+        'condition_id': 'behavior_true30_assumed30',
+        'reference_condition_id': 'behavior_true30_assumed30',
+        'category': 'behavior_reliability',
+        'severity': 'correct',
+        'description': 'True adjacent effort deviation 30%; coordinator correctly assumes 30%.',
+        'true_beta': 8.0,
+        'assumed_beta': 8.0,
+        'true_cost_power': 2.0,
+        'assumed_cost_power': 2.0,
+        'true_behavior_deviation': 0.3,
+        'assumed_behavior_deviation': 0.3,
+        'true_measurement_error': 0.0,
+        'assumed_measurement_error': 0.0,
+    },
+    {
+        'condition_id': 'behavior_true30_assumed10',
+        'reference_condition_id': 'behavior_true30_assumed30',
+        'category': 'behavior_reliability',
+        'severity': 'underestimated',
+        'description': 'True adjacent effort deviation 30%; coordinator assumes only 10%.',
+        'true_beta': 8.0,
+        'assumed_beta': 8.0,
+        'true_cost_power': 2.0,
+        'assumed_cost_power': 2.0,
+        'true_behavior_deviation': 0.3,
+        'assumed_behavior_deviation': 0.1,
+        'true_measurement_error': 0.0,
+        'assumed_measurement_error': 0.0,
+    },
+    {
+        'condition_id': 'behavior_true30_assumed0',
+        'reference_condition_id': 'behavior_true30_assumed30',
+        'category': 'behavior_reliability',
+        'severity': 'ignored',
+        'description': 'True adjacent effort deviation 30%; coordinator assumes deterministic effort.',
+        'true_beta': 8.0,
+        'assumed_beta': 8.0,
+        'true_cost_power': 2.0,
+        'assumed_cost_power': 2.0,
+        'true_behavior_deviation': 0.3,
+        'assumed_behavior_deviation': 0.0,
+        'true_measurement_error': 0.0,
+        'assumed_measurement_error': 0.0,
+    },
+    {
+        'condition_id': 'measurement_true30_assumed30',
+        'reference_condition_id': 'measurement_true30_assumed30',
+        'category': 'measurement_reliability',
+        'severity': 'correct',
+        'description': 'True adjacent effort-report error 30%; coordinator correctly assumes 30%.',
+        'true_beta': 8.0,
+        'assumed_beta': 8.0,
+        'true_cost_power': 2.0,
+        'assumed_cost_power': 2.0,
+        'true_behavior_deviation': 0.0,
+        'assumed_behavior_deviation': 0.0,
+        'true_measurement_error': 0.3,
+        'assumed_measurement_error': 0.3,
+    },
+    {
+        'condition_id': 'measurement_true30_assumed10',
+        'reference_condition_id': 'measurement_true30_assumed30',
+        'category': 'measurement_reliability',
+        'severity': 'underestimated',
+        'description': 'True adjacent effort-report error 30%; coordinator assumes only 10%.',
+        'true_beta': 8.0,
+        'assumed_beta': 8.0,
+        'true_cost_power': 2.0,
+        'assumed_cost_power': 2.0,
+        'true_behavior_deviation': 0.0,
+        'assumed_behavior_deviation': 0.0,
+        'true_measurement_error': 0.3,
+        'assumed_measurement_error': 0.1,
+    },
+    {
+        'condition_id': 'measurement_true30_assumed0',
+        'reference_condition_id': 'measurement_true30_assumed30',
+        'category': 'measurement_reliability',
+        'severity': 'ignored',
+        'description': 'True adjacent effort-report error 30%; coordinator assumes exact observation.',
+        'true_beta': 8.0,
+        'assumed_beta': 8.0,
+        'true_cost_power': 2.0,
+        'assumed_cost_power': 2.0,
+        'true_behavior_deviation': 0.0,
+        'assumed_behavior_deviation': 0.0,
+        'true_measurement_error': 0.3,
+        'assumed_measurement_error': 0.0,
+    },
+]
+if SMOKE_TEST:
+    CONDITIONS = CONDITIONS[:1]
+    REPLICATION_COUNT_PER_CONDITION = 1
+
+OUTPUT_ROOT = Path("/content") if Path("/content").exists() else Path.cwd()
+OUTPUT_DIR = OUTPUT_ROOT / f"{SCRIPT_LABEL}_outputs"
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+ZIP_PATH = OUTPUT_ROOT / f"{SCRIPT_LABEL}_outputs.zip"
+
+
+def validate_configuration():
+    assert WORKER_COUNT == 5
+    assert TOTAL_WORKLOAD > 0 and ADAPTIVE_HORIZON >= 2
+    assert WARMUP_ROUNDS == 0
+    assert EFFORT_MODE_COUNT == 21
+    assert 0.0 < GRID_MARGINAL_PRIOR_MASS < 1.0
+    assert GRID_LOG_SPACING == 0.025
+    assert REPLICATION_COUNT_PER_CONDITION >= 1
+    ids = [condition["condition_id"] for condition in CONDITIONS]
+    assert len(ids) == len(set(ids))
+    id_set = set(ids)
+    for condition in CONDITIONS:
+        assert condition["reference_condition_id"] in id_set
+        for key in (
+            "true_behavior_deviation",
+            "assumed_behavior_deviation",
+            "true_measurement_error",
+            "assumed_measurement_error",
+        ):
+            assert 0.0 <= float(condition[key]) < 1.0
+
+
+validate_configuration()
+if OUTPUT_DIR.exists() and not RESUME_FROM_CHECKPOINT:
+    shutil.rmtree(OUTPUT_DIR)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+
+# =============================================================================
+# 2. BASIC MODEL
+# =============================================================================
+
+
+def sigmoid(values):
+    values = np.asarray(values, dtype=float)
+    result = np.empty_like(values)
+    positive = values >= 0
+    result[positive] = 1.0 / (1.0 + np.exp(-values[positive]))
+    exp_values = np.exp(values[~positive])
+    result[~positive] = exp_values / (1.0 + exp_values)
+    return result
+
+
+def success_probability(effort, workload, capacity, beta):
+    capacity_array = np.asarray(capacity, dtype=float)
+    if int(workload) <= 0 or float(effort) <= 0.0:
+        return np.zeros_like(capacity_array)
+    rho = float(workload) / capacity_array
+    return sigmoid(float(beta) * (float(effort) - rho))
+
+
+def choose_optimal_effort(workload, capacity, resource_aversion, beta, cost_power):
+    workload = int(workload)
+    capacity_array, resource_array = np.broadcast_arrays(
+        np.asarray(capacity, dtype=float),
+        np.asarray(resource_aversion, dtype=float),
+    )
+    if workload <= 0:
+        zeros_float = np.zeros(capacity_array.shape, dtype=float)
+        zeros_mode = np.zeros(capacity_array.shape, dtype=np.int64)
+        return zeros_mode, zeros_float.copy(), zeros_float.copy(), zeros_float.copy()
+    flat_capacity = capacity_array.reshape(-1)
+    probabilities = np.array(
+        [success_probability(effort, workload, flat_capacity, beta) for effort in EFFORT_GRID],
+        dtype=float,
+    )
+    utilities = PAYMENT_PER_UNIT * probabilities - resource_array.reshape(1, -1) * (EFFORT_GRID[:, None] ** float(cost_power))
+    best_indices = np.argmax(utilities, axis=0)  # lowest effort wins exact ties
+    columns = np.arange(utilities.shape[1])
+    best_probability = probabilities[best_indices, columns]
+    best_utility = utilities[best_indices, columns]
+    return best_indices, EFFORT_GRID[best_indices], best_probability, best_utility
+
+
+def coordinator_worker_utility(workload, probability):
+    workload = int(workload)
+    coefficient = COORDINATOR_SUCCESS_VALUE - PAYMENT_PER_UNIT + COORDINATOR_FAILURE_LOSS
+    return float(workload * (coefficient * float(probability) - COORDINATOR_FAILURE_LOSS))
+
+
+def realized_coordinator_worker_utility(workload, outcome):
+    workload = int(workload)
+    if workload <= 0:
+        return 0.0
+    reward = COORDINATOR_SUCCESS_VALUE - PAYMENT_PER_UNIT if int(outcome) == 1 else -COORDINATOR_FAILURE_LOSS
+    return float(workload * reward)
+
+
+def build_adjacent_transition(total_deviation):
+    """Row m gives P(output mode | central mode m).
+
+    The total deviation mass is split between the immediately lower and higher
+    modes. At a boundary, the missing side is folded back into the central mode.
+    """
+    total_deviation = float(total_deviation)
+    matrix = np.zeros((EFFORT_MODE_COUNT, EFFORT_MODE_COUNT), dtype=float)
+    for center in range(EFFORT_MODE_COUNT):
+        matrix[center, center] = 1.0 - total_deviation
+        half = total_deviation / 2.0
+        if center > 0:
+            matrix[center, center - 1] += half
+        else:
+            matrix[center, center] += half
+        if center < EFFORT_MODE_COUNT - 1:
+            matrix[center, center + 1] += half
+        else:
+            matrix[center, center] += half
+    return matrix
+
+
+def add_uniform_floor(matrix, total_floor):
+    matrix = np.asarray(matrix, dtype=float)
+    floor = float(total_floor)
+    result = (1.0 - floor) * matrix + floor / float(matrix.shape[1])
+    result /= result.sum(axis=1, keepdims=True)
+    return result
+
+
+def draw_categorical(probabilities, uniform):
+    probabilities = np.asarray(probabilities, dtype=float)
+    cumulative = np.cumsum(probabilities)
+    index = int(np.searchsorted(cumulative, min(float(uniform), 1.0 - 1e-15), side="right"))
+    return min(index, len(probabilities) - 1)
+
+
+# =============================================================================
+# 3. FIXED BROAD QUADRATURE GRID
+# =============================================================================
+
+X_PRIOR_LOCATION = math.log(PRIOR_MEDIAN_CAPACITY / I_REFERENCE)
+Z_PRIOR_LOCATION = math.log(PRIOR_MEDIAN_LAMBDA / PAYMENT_PER_UNIT)
+
+
+def student_t_log_density(values, location, scale):
+    standardized = (np.asarray(values) - location) / scale
+    return -math.log(scale) - 0.5 * (PRIOR_DF + 1.0) * np.log1p((standardized ** 2) / PRIOR_DF)
+
+
+def build_global_grid():
+    tail = (1.0 - GRID_MARGINAL_PRIOR_MASS) / 2.0
+    low_q = float(student_t_distribution.ppf(tail, df=PRIOR_DF))
+    high_q = float(student_t_distribution.ppf(1.0 - tail, df=PRIOR_DF))
+    x_low = X_PRIOR_LOCATION + PRIOR_X_SCALE * low_q
+    x_high = X_PRIOR_LOCATION + PRIOR_X_SCALE * high_q
+    z_low = Z_PRIOR_LOCATION + PRIOR_Z_SCALE * low_q
+    z_high = Z_PRIOR_LOCATION + PRIOR_Z_SCALE * high_q
+    n_x = max(5, int(math.ceil((x_high - x_low) / GRID_LOG_SPACING)))
+    n_z = max(5, int(math.ceil((z_high - z_low) / GRID_LOG_SPACING)))
+    dx = (x_high - x_low) / n_x
+    dz = (z_high - z_low) / n_z
+    x = x_low + (np.arange(n_x) + 0.5) * dx
+    z = z_low + (np.arange(n_z) + 0.5) * dz
+    x_mesh, z_mesh = np.meshgrid(x, z, indexing="ij")
+    x_vec = x_mesh.ravel()
+    z_vec = z_mesh.ravel()
+    capacities = I_REFERENCE * np.exp(x_vec)
+    lambdas = PAYMENT_PER_UNIT * np.exp(z_vec)
+    log_prior = student_t_log_density(x_vec, X_PRIOR_LOCATION, PRIOR_X_SCALE) + student_t_log_density(z_vec, Z_PRIOR_LOCATION, PRIOR_Z_SCALE)
+    prior = np.exp(log_prior - np.max(log_prior))
+    prior /= np.sum(prior)
+    return {
+        "x": x_vec,
+        "z": z_vec,
+        "capacity": capacities,
+        "lambda": lambdas,
+        "prior": prior,
+        "n_x": n_x,
+        "n_z": n_z,
+        "dx": dx,
+        "dz": dz,
+        "bounds": {"x_low": x_low, "x_high": x_high, "z_low": z_low, "z_high": z_high},
+    }
+
+
+GRID = build_global_grid()
+GRID_SIZE = len(GRID["prior"])
+
+
+# =============================================================================
+# 4. ASSUMED AND TRUE SCENARIO MODELS
+# =============================================================================
+
+
+def compute_success_by_mode(workload, capacities, beta):
+    return np.vstack([
+        success_probability(effort, workload, capacities, beta)
+        for effort in EFFORT_GRID
+    ])
+
+
+def build_assumed_model(condition):
+    assumed_beta = float(condition["assumed_beta"])
+    assumed_power = float(condition["assumed_cost_power"])
+    base_behavior = build_adjacent_transition(condition["assumed_behavior_deviation"])
+    behavior_matrix = add_uniform_floor(base_behavior, NUMERICAL_BEHAVIOR_FLOOR)
+    base_measurement = build_adjacent_transition(condition["assumed_measurement_error"])
+    measurement_matrix = add_uniform_floor(base_measurement, NUMERICAL_OBSERVATION_FLOOR)
+
+    probability_matrix = np.zeros((TOTAL_WORKLOAD + 1, GRID_SIZE), dtype=np.float64)
+    optimal_mode_matrix = np.zeros((TOTAL_WORKLOAD + 1, GRID_SIZE), dtype=np.int8)
+
+    for workload in range(TOTAL_WORKLOAD + 1):
+        modes, _, _, _ = choose_optimal_effort(
+            workload,
+            GRID["capacity"],
+            GRID["lambda"],
+            assumed_beta,
+            assumed_power,
+        )
+        modes = modes.astype(np.int8)
+        optimal_mode_matrix[workload] = modes
+        if workload <= 0:
+            continue
+        success_modes = compute_success_by_mode(workload, GRID["capacity"], assumed_beta)
+        behavior_rows = behavior_matrix[modes]  # grid x actual mode
+        probability_matrix[workload] = np.sum(behavior_rows.T * success_modes, axis=0)
+
+    probability_matrix = np.clip(probability_matrix, PROBABILITY_CLIP, 1.0 - PROBABILITY_CLIP)
+    probability_matrix[0] = 0.0
+    prior_predictive_curve = probability_matrix @ GRID["prior"]
+
+    return {
+        "condition_id": condition["condition_id"],
+        "assumed_beta": assumed_beta,
+        "assumed_cost_power": assumed_power,
+        "behavior_matrix": behavior_matrix,
+        "measurement_matrix": measurement_matrix,
+        "probability_matrix": probability_matrix,
+        "optimal_mode_matrix": optimal_mode_matrix,
+        "prior_predictive_curve": prior_predictive_curve,
+        "joint_cache": OrderedDict(),
+    }
+
+
+def get_joint_likelihoods(model, workload):
+    """Return P(outcome, observed effort mode | theta, workload).
+
+    Result shape is (2 outcomes, 21 observed modes, grid size). Cached as
+    float32 and promoted during dot products. The outcome-only marginal remains
+    in model['probability_matrix'].
+    """
+    workload = int(workload)
+    if workload in model["joint_cache"]:
+        value = model["joint_cache"].pop(workload)
+        model["joint_cache"][workload] = value
+        return value
+
+    if workload <= 0:
+        result = np.zeros((2, EFFORT_MODE_COUNT, GRID_SIZE), dtype=np.float32)
+        result[0, 0, :] = 1.0
+    else:
+        modes = model["optimal_mode_matrix"][workload]
+        behavior_rows = model["behavior_matrix"][modes].T  # actual mode x grid
+        success_modes = compute_success_by_mode(workload, GRID["capacity"], model["assumed_beta"])
+        success_weighted = behavior_rows * success_modes
+        failure_weighted = behavior_rows * (1.0 - success_modes)
+        observation = model["measurement_matrix"]
+        joint_success = observation.T @ success_weighted
+        joint_failure = observation.T @ failure_weighted
+        result = np.stack([joint_failure, joint_success], axis=0).astype(np.float32)
+
+    model["joint_cache"][workload] = result
+    while len(model["joint_cache"]) > JOINT_CACHE_MAX_WORKLOADS:
+        model["joint_cache"].popitem(last=False)
+    return result
+
+
+def build_true_model(condition):
+    true_beta = float(condition["true_beta"])
+    true_power = float(condition["true_cost_power"])
+    behavior_matrix = build_adjacent_transition(condition["true_behavior_deviation"])
+    measurement_matrix = build_adjacent_transition(condition["true_measurement_error"])
+
+    marginal_probability = np.zeros((len(WORKER_CATALOG), TOTAL_WORKLOAD + 1), dtype=float)
+    optimal_modes = np.zeros((len(WORKER_CATALOG), TOTAL_WORKLOAD + 1), dtype=np.int8)
+    expected_effort = np.zeros((len(WORKER_CATALOG), TOTAL_WORKLOAD + 1), dtype=float)
+
+    for catalog_index, worker in enumerate(WORKER_CATALOG):
+        for workload in range(TOTAL_WORKLOAD + 1):
+            mode, _, _, _ = choose_optimal_effort(
+                workload,
+                np.array([worker["capacity"]]),
+                np.array([worker["lambda"]]),
+                true_beta,
+                true_power,
+            )
+            central_mode = int(mode[0])
+            optimal_modes[catalog_index, workload] = central_mode
+            distribution = behavior_matrix[central_mode]
+            expected_effort[catalog_index, workload] = float(np.dot(distribution, EFFORT_GRID))
+            if workload > 0:
+                success_modes = np.array([
+                    float(success_probability(effort, workload, np.array([worker["capacity"]]), true_beta)[0])
+                    for effort in EFFORT_GRID
+                ])
+                marginal_probability[catalog_index, workload] = float(np.dot(distribution, success_modes))
+
+    return {
+        "condition_id": condition["condition_id"],
+        "true_beta": true_beta,
+        "true_cost_power": true_power,
+        "behavior_matrix": behavior_matrix,
+        "measurement_matrix": measurement_matrix,
+        "marginal_probability": marginal_probability,
+        "optimal_modes": optimal_modes,
+        "expected_effort": expected_effort,
+    }
+
+
+# =============================================================================
+# 5. POSTERIOR STATE
+# =============================================================================
+
+
+def initialize_state(policy, worker_id, model):
+    return {
+        "policy": policy,
+        "worker_id": worker_id,
+        "weights": GRID["prior"].copy(),
+        "predicted_curve": model["prior_predictive_curve"].copy(),
+        "outcome_count": 0,
+        "monitor_count": 0,
+        "minimum_normalizer": 1.0,
+    }
+
+
+def posterior_update(state, workload, outcome, model, observed_effort_mode=None):
+    workload = int(workload)
+    if workload <= 0:
+        return
+    if observed_effort_mode is None:
+        probabilities = model["probability_matrix"][workload]
+        likelihood = probabilities if int(outcome) == 1 else 1.0 - probabilities
+    else:
+        joint = get_joint_likelihoods(model, workload)
+        likelihood = joint[int(outcome), int(observed_effort_mode)].astype(np.float64, copy=False)
+
+    unnormalized = state["weights"] * likelihood
+    normalizer = float(np.sum(unnormalized))
+    if normalizer <= 0.0 or not np.isfinite(normalizer):
+        raise RuntimeError("Posterior normalization failed despite global support and positive likelihood floors.")
+    state["weights"] = unnormalized / normalizer
+    state["predicted_curve"] = model["probability_matrix"] @ state["weights"]
+    state["outcome_count"] += 1
+    state["minimum_normalizer"] = min(state["minimum_normalizer"], normalizer)
+    if observed_effort_mode is not None:
+        state["monitor_count"] += 1
+
+
+def posterior_summary(state):
+    weights = state["weights"]
+    capacity_mean = float(np.dot(weights, GRID["capacity"]))
+    lambda_mean = float(np.dot(weights, GRID["lambda"]))
+    ess = float(1.0 / np.sum(weights ** 2))
+    entropy = float(-np.sum(weights * np.log(np.maximum(weights, 1e-300))))
+    return capacity_mean, lambda_mean, ess, entropy
+
+
+def predictive_variance(state, workload, model):
+    probabilities = model["probability_matrix"][int(workload)]
+    mean = float(np.dot(state["weights"], probabilities))
+    second = float(np.dot(state["weights"], probabilities ** 2))
+    return max(0.0, second - mean ** 2)
+
+
+# =============================================================================
+# 6. POPULATION SCHEDULE
+# =============================================================================
+
+
+def build_population_schedule():
+    event_map = {int(event["adaptive_round"]): event for event in REPLACEMENT_EVENTS}
+    arrivals = {1: list(range(WORKER_COUNT))}
+    for event in REPLACEMENT_EVENTS:
+        arrivals.setdefault(int(event["adaptive_round"]), []).append(int(event["slot_index"]))
+    return event_map, arrivals
+
+
+REPLACEMENT_EVENT_MAP, ARRIVALS_BY_ROUND = build_population_schedule()
+
+
+def next_reset_mask(round_number):
+    mask = np.zeros(WORKER_COUNT, dtype=bool)
+    event = REPLACEMENT_EVENT_MAP.get(int(round_number) + 1)
+    if event is not None:
+        mask[int(event["slot_index"])] = True
+    return mask
+
+
+# =============================================================================
+# 7. ALLOCATION
+# =============================================================================
+
+
+def allocation_score_matrix(probability_matrix):
+    workloads = np.arange(TOTAL_WORKLOAD + 1, dtype=float)
+    coefficient = COORDINATOR_SUCCESS_VALUE - PAYMENT_PER_UNIT + COORDINATOR_FAILURE_LOSS
+    return workloads[None, :] * (coefficient * probability_matrix - COORDINATOR_FAILURE_LOSS)
+
+
+def optimize_integer_allocation_scalar(probability_matrix):
+    probability_matrix = np.asarray(probability_matrix, dtype=float)
+    score = allocation_score_matrix(probability_matrix)
+    equal_share = TOTAL_WORKLOAD / WORKER_COUNT
+    value = np.full((WORKER_COUNT + 1, TOTAL_WORKLOAD + 1), -np.inf)
+    secondary = np.full_like(value, -np.inf)
+    choice = np.full((WORKER_COUNT + 1, TOTAL_WORKLOAD + 1), -1, dtype=int)
+    value[0, 0] = 0.0
+    secondary[0, 0] = 0.0
+    for worker_index in range(1, WORKER_COUNT + 1):
+        for total in range(TOTAL_WORKLOAD + 1):
+            best_value = -np.inf
+            best_secondary = -np.inf
+            best_current = -1
+            for current in range(total + 1):
+                previous_total = total - current
+                if not np.isfinite(value[worker_index - 1, previous_total]):
+                    continue
+                candidate_value = value[worker_index - 1, previous_total] + score[worker_index - 1, current]
+                candidate_secondary = secondary[worker_index - 1, previous_total] - (current - equal_share) ** 2
+                better_value = candidate_value > best_value + ALLOCATION_TIE_TOL
+                tied_value = abs(candidate_value - best_value) <= ALLOCATION_TIE_TOL
+                better_secondary = candidate_secondary > best_secondary + ALLOCATION_TIE_TOL
+                if better_value or (tied_value and better_secondary):
+                    best_value = candidate_value
+                    best_secondary = candidate_secondary
+                    best_current = current
+            value[worker_index, total] = best_value
+            secondary[worker_index, total] = best_secondary
+            choice[worker_index, total] = best_current
+    allocation = np.zeros(WORKER_COUNT, dtype=int)
+    remaining = TOTAL_WORKLOAD
+    for worker_index in range(WORKER_COUNT, 0, -1):
+        allocation[worker_index - 1] = choice[worker_index, remaining]
+        remaining -= allocation[worker_index - 1]
+    if remaining != 0 or int(np.sum(allocation)) != TOTAL_WORKLOAD:
+        raise RuntimeError("Allocation reconstruction failed.")
+    return {"allocation": allocation, "objective": float(value[WORKER_COUNT, TOTAL_WORKLOAD])}
+
+
+def optimize_integer_allocation_batch(probability_tensor):
+    probability_tensor = np.asarray(probability_tensor, dtype=float)
+    batch_size = probability_tensor.shape[0]
+    workloads = np.arange(TOTAL_WORKLOAD + 1, dtype=float)
+    coefficient = COORDINATOR_SUCCESS_VALUE - PAYMENT_PER_UNIT + COORDINATOR_FAILURE_LOSS
+    score_tensor = workloads[None, None, :] * (coefficient * probability_tensor - COORDINATOR_FAILURE_LOSS)
+    equal_share = TOTAL_WORKLOAD / WORKER_COUNT
+    previous = np.full((batch_size, TOTAL_WORKLOAD + 1), -np.inf)
+    previous_secondary = np.full_like(previous, -np.inf)
+    previous[:, 0] = 0.0
+    previous_secondary[:, 0] = 0.0
+    for worker_index in range(WORKER_COUNT):
+        next_value = np.full_like(previous, -np.inf)
+        next_secondary = np.full_like(previous_secondary, -np.inf)
+        for total in range(TOTAL_WORKLOAD + 1):
+            currents = np.arange(total + 1, dtype=int)
+            previous_totals = total - currents
+            candidates = previous[:, previous_totals] + score_tensor[:, worker_index, currents]
+            best_values = np.max(candidates, axis=1)
+            value_ties = np.isclose(candidates, best_values[:, None], atol=ALLOCATION_TIE_TOL, rtol=0.0)
+            secondary_candidates = previous_secondary[:, previous_totals] - (currents[None, :] - equal_share) ** 2
+            eligible = np.where(value_ties, secondary_candidates, -np.inf)
+            next_value[:, total] = best_values
+            next_secondary[:, total] = np.max(eligible, axis=1)
+        previous = next_value
+        previous_secondary = next_secondary
+    return previous[:, TOTAL_WORKLOAD]
+
+
+def current_probability_matrix(states):
+    return np.vstack([state["predicted_curve"] for state in states])
+
+
+def evaluate_true_expected_utility(allocation, active_catalog, true_model):
+    return float(sum(
+        coordinator_worker_utility(
+            int(allocation[slot]),
+            true_model["marginal_probability"][int(active_catalog[slot]), int(allocation[slot])],
+        )
+        for slot in range(WORKER_COUNT)
+    ))
+
+
+# =============================================================================
+# 8. ONE-STEP INDIVIDUAL EVSI
+# =============================================================================
+
+
+def deterministic_curve_option(curve):
+    return [{"probability": 1.0, "curve": np.asarray(curve, dtype=float), "outcome": None, "effort_mode": None}]
+
+
+def local_signal_options(state, workload, monitored, model):
+    workload = int(workload)
+    if workload <= 0:
+        return deterministic_curve_option(state["predicted_curve"])
+
+    weights = state["weights"]
+    options = []
+    if not monitored:
+        probabilities = model["probability_matrix"][workload]
+        for outcome in (0, 1):
+            likelihood = probabilities if outcome == 1 else 1.0 - probabilities
+            weighted = weights * likelihood
+            branch_probability = float(np.sum(weighted))
+            if branch_probability <= SIGNAL_PROBABILITY_FLOOR:
+                continue
+            curve = (model["probability_matrix"] @ weighted) / branch_probability
+            options.append({
+                "probability": branch_probability,
+                "curve": curve,
+                "outcome": int(outcome),
+                "effort_mode": None,
+            })
+    else:
+        joint = get_joint_likelihoods(model, workload)
+        for outcome in (0, 1):
+            for observed_mode in range(EFFORT_MODE_COUNT):
+                likelihood = joint[outcome, observed_mode].astype(np.float64, copy=False)
+                weighted = weights * likelihood
+                branch_probability = float(np.sum(weighted))
+                if branch_probability <= SIGNAL_PROBABILITY_FLOOR:
+                    continue
+                curve = (model["probability_matrix"] @ weighted) / branch_probability
+                options.append({
+                    "probability": branch_probability,
+                    "curve": curve,
+                    "outcome": int(outcome),
+                    "effort_mode": int(observed_mode),
+                })
+
+    total = float(sum(option["probability"] for option in options))
+    if abs(total - 1.0) > NORMALIZATION_TOLERANCE:
+        raise RuntimeError(f"Local signal branches do not normalize: {total}")
+    return options
+
+
+def enumerate_expected_next_value(option_sets):
+    counts = [len(options) for options in option_sets]
+    combinations = np.array(list(itertools.product(*[range(count) for count in counts])), dtype=int)
+    branch_count = len(combinations)
+    branch_probabilities = np.ones(branch_count, dtype=float)
+    tensor = np.zeros((branch_count, WORKER_COUNT, TOTAL_WORKLOAD + 1), dtype=float)
+    for worker_index, options in enumerate(option_sets):
+        selected = combinations[:, worker_index]
+        probabilities = np.asarray([option["probability"] for option in options], dtype=float)
+        curves = np.vstack([option["curve"] for option in options])
+        branch_probabilities *= probabilities[selected]
+        tensor[:, worker_index, :] = curves[selected]
+    positive = branch_probabilities > SIGNAL_PROBABILITY_FLOOR
+    branch_probabilities = branch_probabilities[positive]
+    tensor = tensor[positive]
+    probability_sum = float(np.sum(branch_probabilities))
+    if abs(probability_sum - 1.0) > NORMALIZATION_TOLERANCE:
+        raise RuntimeError(f"Joint signal branches do not normalize: {probability_sum}")
+    optimized_values = optimize_integer_allocation_batch(tensor)
+    return {
+        "expected_value": float(np.dot(branch_probabilities, optimized_values)),
+        "branch_count": int(len(branch_probabilities)),
+        "probability_sum_error": abs(probability_sum - 1.0),
+    }
+
+
+def slots_from_mask(mask):
+    return tuple(index for index in range(WORKER_COUNT) if mask & (1 << index))
+
+
+def mask_string(mask):
+    slots = slots_from_mask(mask)
+    return "|".join(str(value) for value in slots) if slots else ""
+
+
+def evaluate_individual_monitoring_evsi(states, allocation, next_reset, monitoring_cost, model):
+    start = time.perf_counter()
+    allocation = np.asarray(allocation, dtype=int)
+    next_reset = np.asarray(next_reset, dtype=bool)
+
+    unmonitored_options = []
+    monitored_options = []
+    eligible_slots = []
+    for slot in range(WORKER_COUNT):
+        if next_reset[slot]:
+            prior_option = deterministic_curve_option(model["prior_predictive_curve"])
+            unmonitored_options.append(prior_option)
+            monitored_options.append(prior_option)
+        else:
+            unmonitored_options.append(local_signal_options(states[slot], allocation[slot], False, model))
+            monitored_options.append(local_signal_options(states[slot], allocation[slot], True, model))
+            if allocation[slot] > 0:
+                eligible_slots.append(slot)
+
+    no_monitor_result = enumerate_expected_next_value(unmonitored_options)
+    no_monitor_value = float(no_monitor_result["expected_value"])
+    rows = [{
+        "candidate_worker_slot": -1,
+        "gross_evsi": 0.0,
+        "net_value": 0.0,
+        "expected_next_value": no_monitor_value,
+        "no_monitor_expected_next_value": no_monitor_value,
+        "branch_count": int(no_monitor_result["branch_count"]),
+        "probability_sum_error": float(no_monitor_result["probability_sum_error"]),
+        "selected": False,
+    }]
+
+    selected_mask = 0
+    selected_gross = 0.0
+    selected_net = 0.0
+    for slot in eligible_slots:
+        option_sets = list(unmonitored_options)
+        option_sets[slot] = monitored_options[slot]
+        result = enumerate_expected_next_value(option_sets)
+        gross = float(result["expected_value"] - no_monitor_value)
+        if gross < -NONNEGATIVITY_TOLERANCE:
+            raise RuntimeError(f"Materially negative individual EVSI for worker {slot}: {gross}")
+        gross = max(0.0, gross)
+        net = gross - float(monitoring_cost)
+        selected = bool(net > DECISION_TIE_TOL)
+        if selected:
+            selected_mask |= 1 << slot
+            selected_gross += gross
+            selected_net += net
+        rows.append({
+            "candidate_worker_slot": int(slot),
+            "gross_evsi": gross,
+            "net_value": net,
+            "expected_next_value": float(result["expected_value"]),
+            "no_monitor_expected_next_value": no_monitor_value,
+            "branch_count": int(result["branch_count"]),
+            "probability_sum_error": float(result["probability_sum_error"]),
+            "selected": selected,
+        })
+
+    return {
+        "selected_mask": int(selected_mask),
+        "selected_gross_evsi": float(selected_gross),
+        "selected_net_value": float(selected_net),
+        "rows": rows,
+        "runtime_seconds": float(time.perf_counter() - start),
+    }
+
+
+# =============================================================================
+# 9. POLICY AND ENVIRONMENT SIMULATION
+# =============================================================================
+
+
+def identity_summary_row(state, policy, condition, catalog_index, slot, round_number, reason, seed, model, true_model):
+    capacity_mean, lambda_mean, ess, entropy = posterior_summary(state)
+    true_curve = true_model["marginal_probability"][int(catalog_index), :16]
+    predicted_curve = state["predicted_curve"][:16]
+    rmse = float(np.sqrt(np.mean((true_curve - predicted_curve) ** 2)))
+    return {
+        "condition_id": condition["condition_id"],
+        "category": condition["category"],
+        "severity": condition["severity"],
+        "environment_seed": int(seed),
+        "policy": policy,
+        "catalog_index": int(catalog_index),
+        "worker_id": WORKER_CATALOG[int(catalog_index)]["worker_id"],
+        "slot_index": int(slot),
+        "terminal_round": int(round_number),
+        "terminal_reason": reason,
+        "outcome_count": int(state["outcome_count"]),
+        "monitor_count": int(state["monitor_count"]),
+        "posterior_capacity_mean": capacity_mean,
+        "posterior_lambda_mean": lambda_mean,
+        "posterior_ess": ess,
+        "posterior_entropy": entropy,
+        "predictive_rmse_I0_15": rmse,
+        "minimum_update_normalizer": float(state["minimum_normalizer"]),
+    }
+
+
+def policy_monitor_mask(policy, states, allocation, arrivals, round_number, reset_mask, candidate_rows, model):
+    if round_number >= ADAPTIVE_HORIZON:
+        return 0, "final_round", math.nan, math.nan, 0.0
+    eligible = [slot for slot in range(WORKER_COUNT) if allocation[slot] > 0 and not reset_mask[slot]]
+    if policy == "outcome_only":
+        return 0, "none", math.nan, math.nan, 0.0
+    if policy == "monitor_on_arrival":
+        mask = sum(1 << slot for slot in arrivals if slot in eligible)
+        return mask, "arrival_trigger", math.nan, math.nan, 0.0
+    if policy == "uncertainty_proxy":
+        scores = []
+        mask = 0
+        coefficient = COORDINATOR_SUCCESS_VALUE - PAYMENT_PER_UNIT + COORDINATOR_FAILURE_LOSS
+        for slot in eligible:
+            workload = int(allocation[slot])
+            score = coefficient * workload * math.sqrt(predictive_variance(states[slot], workload, model))
+            scores.append(score)
+            if score > MONITORING_COST + DECISION_TIE_TOL:
+                mask |= 1 << slot
+        return mask, "utility_scaled_predictive_sd", (max(scores) if scores else 0.0), math.nan, 0.0
+    if policy == "individual_evsi":
+        result = evaluate_individual_monitoring_evsi(states, allocation, reset_mask, MONITORING_COST, model)
+        candidate_rows.extend(result["rows"])
+        return (
+            result["selected_mask"],
+            "one_step_individual_evsi_threshold",
+            result["selected_gross_evsi"],
+            result["selected_net_value"],
+            result["runtime_seconds"],
+        )
+    raise ValueError(policy)
+
+
+def sample_true_interaction(true_model, catalog, workload, effort_uniform, outcome_uniform, observation_uniform):
+    workload = int(workload)
+    if workload <= 0:
+        return 0, 0, 0, 0.0
+    central_mode = int(true_model["optimal_modes"][catalog, workload])
+    actual_mode = draw_categorical(true_model["behavior_matrix"][central_mode], effort_uniform)
+    effort = float(EFFORT_GRID[actual_mode])
+    probability = float(success_probability(
+        effort,
+        workload,
+        np.array([WORKER_CATALOG[catalog]["capacity"]]),
+        true_model["true_beta"],
+    )[0])
+    outcome = int(float(outcome_uniform) < probability)
+    observed_mode = draw_categorical(true_model["measurement_matrix"][actual_mode], observation_uniform)
+    return actual_mode, observed_mode, outcome, probability
+
+
+def run_one_environment(condition, replication_index, model, true_model):
+    seed = BASE_RANDOM_SEED + int(replication_index)
+    start = time.perf_counter()
+    rng = np.random.default_rng(seed)
+
+    # Common random numbers are shared across policies and reused across
+    # conditions with the same replication index.
+    effort_uniforms = rng.random((ADAPTIVE_HORIZON, WORKER_COUNT))
+    outcome_uniforms = rng.random((ADAPTIVE_HORIZON, WORKER_COUNT))
+    observation_uniforms = rng.random((ADAPTIVE_HORIZON, WORKER_COUNT))
+
+    states_by_policy = {
+        policy: [initialize_state(policy, WORKER_CATALOG[index]["worker_id"], model) for index in INITIAL_ACTIVE_CATALOG_INDICES]
+        for policy in LEARNING_POLICY_NAMES
+    }
+    active = tuple(INITIAL_ACTIVE_CATALOG_INDICES)
+    round_rows = []
+    monitor_rows = []
+    candidate_rows = []
+    identity_rows = []
+
+    effective_horizon = 2 if SMOKE_TEST else ADAPTIVE_HORIZON
+
+    for round_number in range(1, effective_horizon + 1):
+        round_start = time.perf_counter()
+        event = REPLACEMENT_EVENT_MAP.get(round_number)
+        arrivals = list(ARRIVALS_BY_ROUND.get(round_number, []))
+        if event is not None:
+            slot = int(event["slot_index"])
+            old_catalog = int(active[slot])
+            for policy in LEARNING_POLICY_NAMES:
+                identity_rows.append(identity_summary_row(
+                    states_by_policy[policy][slot], policy, condition, old_catalog, slot,
+                    round_number - 1, "replacement", seed, model, true_model,
+                ))
+            active_list = list(active)
+            active_list[slot] = int(event["new_catalog_index"])
+            active = tuple(active_list)
+            for policy in LEARNING_POLICY_NAMES:
+                states_by_policy[policy][slot] = initialize_state(
+                    policy,
+                    WORKER_CATALOG[int(active[slot])]["worker_id"],
+                    model,
+                )
+
+        reset_mask = next_reset_mask(round_number)
+        allocations = {}
+        predicted_objectives = {}
+        for policy in LEARNING_POLICY_NAMES:
+            solution = optimize_integer_allocation_scalar(current_probability_matrix(states_by_policy[policy]))
+            allocations[policy] = solution["allocation"]
+            predicted_objectives[policy] = solution["objective"]
+
+        true_probability_matrix = true_model["marginal_probability"][np.asarray(active, dtype=int)]
+        oracle_solution = optimize_integer_allocation_scalar(true_probability_matrix)
+        allocations["oracle_dynamic"] = oracle_solution["allocation"]
+        predicted_objectives["oracle_dynamic"] = oracle_solution["objective"]
+        oracle_expected = evaluate_true_expected_utility(oracle_solution["allocation"], active, true_model)
+
+        decisions = {}
+        for policy in LEARNING_POLICY_NAMES:
+            local_candidate_rows = []
+            decision_start = time.perf_counter()
+            mask, score_type, gross_score, net_score, internal_runtime = policy_monitor_mask(
+                policy,
+                states_by_policy[policy],
+                allocations[policy],
+                arrivals,
+                round_number,
+                reset_mask,
+                local_candidate_rows,
+                model,
+            )
+            decision_runtime = float(time.perf_counter() - decision_start)
+            decisions[policy] = {
+                "mask": int(mask),
+                "score_type": score_type,
+                "gross_score": gross_score,
+                "net_score": net_score,
+                "runtime_seconds": decision_runtime,
+                "internal_runtime_seconds": internal_runtime,
+            }
+            if policy == "individual_evsi":
+                for row in local_candidate_rows:
+                    candidate_rows.append({
+                        "condition_id": condition["condition_id"],
+                        "category": condition["category"],
+                        "severity": condition["severity"],
+                        "environment_seed": int(seed),
+                        "replication_index": int(replication_index),
+                        "adaptive_round": int(round_number),
+                        "allocation": "|".join(str(int(value)) for value in allocations[policy]),
+                        "active_catalog_indices": "|".join(str(int(value)) for value in active),
+                        **row,
+                        "decision_runtime_seconds": decision_runtime,
+                    })
+
+        for policy in LEARNING_POLICY_NAMES:
+            allocation = allocations[policy]
+            decision = decisions[policy]
+            monitor_mask = int(decision["mask"])
+            monitored_slots = slots_from_mask(monitor_mask)
+            true_expected = evaluate_true_expected_utility(allocation, active, true_model)
+            realized = 0.0
+
+            for slot in range(WORKER_COUNT):
+                workload = int(allocation[slot])
+                if workload <= 0:
+                    continue
+                catalog = int(active[slot])
+                actual_mode, observed_mode, outcome, conditional_probability = sample_true_interaction(
+                    true_model,
+                    catalog,
+                    workload,
+                    effort_uniforms[round_number - 1, slot],
+                    outcome_uniforms[round_number - 1, slot],
+                    observation_uniforms[round_number - 1, slot],
+                )
+                realized += realized_coordinator_worker_utility(workload, outcome)
+                monitored_observation = observed_mode if slot in monitored_slots else None
+
+                if slot in monitored_slots:
+                    monitor_rows.append({
+                        "condition_id": condition["condition_id"],
+                        "category": condition["category"],
+                        "severity": condition["severity"],
+                        "environment_seed": int(seed),
+                        "replication_index": int(replication_index),
+                        "adaptive_round": int(round_number),
+                        "policy": policy,
+                        "slot_index": int(slot),
+                        "catalog_index": catalog,
+                        "worker_id": WORKER_CATALOG[catalog]["worker_id"],
+                        "worker_role": WORKER_CATALOG[catalog]["role"],
+                        "arrival_round": bool(slot in arrivals),
+                        "current_workload": workload,
+                        "true_central_effort_mode": int(true_model["optimal_modes"][catalog, workload]),
+                        "actual_effort_mode": int(actual_mode),
+                        "actual_effort": float(EFFORT_GRID[actual_mode]),
+                        "behavior_deviation": bool(actual_mode != int(true_model["optimal_modes"][catalog, workload])),
+                        "observed_effort_mode": int(observed_mode),
+                        "observation_mode_error": int(observed_mode - actual_mode),
+                        "conditional_success_probability": conditional_probability,
+                        "per_worker_monitoring_cost": float(MONITORING_COST),
+                        "decision_score_type": decision["score_type"],
+                    })
+
+                posterior_update(
+                    states_by_policy[policy][slot],
+                    workload,
+                    outcome,
+                    model,
+                    monitored_observation,
+                )
+
+            action_cost = float(MONITORING_COST) * len(monitored_slots)
+            round_rows.append({
+                "condition_id": condition["condition_id"],
+                "category": condition["category"],
+                "severity": condition["severity"],
+                "environment_seed": int(seed),
+                "replication_index": int(replication_index),
+                "adaptive_round": int(round_number),
+                "policy": policy,
+                "active_catalog_indices": "|".join(str(int(value)) for value in active),
+                "arrival_slots": "|".join(str(int(value)) for value in arrivals),
+                "next_reset_slots": "|".join(str(int(value)) for value in np.flatnonzero(reset_mask)),
+                "allocation": "|".join(str(int(value)) for value in allocation),
+                "oracle_allocation": "|".join(str(int(value)) for value in oracle_solution["allocation"]),
+                "predicted_objective": float(predicted_objectives[policy]),
+                "true_expected_utility": true_expected,
+                "realized_utility": realized,
+                "monitor_mask": monitor_mask,
+                "monitored_slots": mask_string(monitor_mask),
+                "monitored_worker_count": len(monitored_slots),
+                "multi_worker_monitoring": len(monitored_slots) > 1,
+                "monitoring_cost": action_cost,
+                "net_true_expected_utility": true_expected - action_cost,
+                "net_realized_utility": realized - action_cost,
+                "oracle_expected_utility": oracle_expected,
+                "gross_regret_to_oracle": oracle_expected - true_expected,
+                "decision_score_type": decision["score_type"],
+                "decision_gross_score": decision["gross_score"],
+                "decision_net_score": decision["net_score"],
+                "decision_runtime_seconds": decision["runtime_seconds"],
+            })
+
+        oracle_allocation = allocations["oracle_dynamic"]
+        oracle_realized = 0.0
+        for slot in range(WORKER_COUNT):
+            workload = int(oracle_allocation[slot])
+            if workload <= 0:
+                continue
+            catalog = int(active[slot])
+            _, _, outcome, _ = sample_true_interaction(
+                true_model,
+                catalog,
+                workload,
+                effort_uniforms[round_number - 1, slot],
+                outcome_uniforms[round_number - 1, slot],
+                observation_uniforms[round_number - 1, slot],
+            )
+            oracle_realized += realized_coordinator_worker_utility(workload, outcome)
+
+        round_rows.append({
+            "condition_id": condition["condition_id"],
+            "category": condition["category"],
+            "severity": condition["severity"],
+            "environment_seed": int(seed),
+            "replication_index": int(replication_index),
+            "adaptive_round": int(round_number),
+            "policy": "oracle_dynamic",
+            "active_catalog_indices": "|".join(str(int(value)) for value in active),
+            "arrival_slots": "|".join(str(int(value)) for value in arrivals),
+            "next_reset_slots": "|".join(str(int(value)) for value in np.flatnonzero(reset_mask)),
+            "allocation": "|".join(str(int(value)) for value in oracle_allocation),
+            "oracle_allocation": "|".join(str(int(value)) for value in oracle_allocation),
+            "predicted_objective": float(predicted_objectives["oracle_dynamic"]),
+            "true_expected_utility": oracle_expected,
+            "realized_utility": oracle_realized,
+            "monitor_mask": 0,
+            "monitored_slots": "",
+            "monitored_worker_count": 0,
+            "multi_worker_monitoring": False,
+            "monitoring_cost": 0.0,
+            "net_true_expected_utility": oracle_expected,
+            "net_realized_utility": oracle_realized,
+            "oracle_expected_utility": oracle_expected,
+            "gross_regret_to_oracle": 0.0,
+            "decision_score_type": "oracle",
+            "decision_gross_score": math.nan,
+            "decision_net_score": math.nan,
+            "decision_runtime_seconds": 0.0,
+        })
+
+        if DETAILED_ROUND_PROGRESS or round_number == 1 or round_number % ROUND_HEARTBEAT_INTERVAL == 0 or round_number == effective_horizon:
+            selected = decisions["individual_evsi"]
+            print(
+                f"    heartbeat condition={condition['condition_id']} rep={replication_index + 1} "
+                f"round={round_number:02d}/{effective_horizon} | monitored={mask_string(selected['mask']) or 'none'} | "
+                f"gross={selected['gross_score']:.5f} net={selected['net_score']:.5f} | "
+                f"round={time.perf_counter() - round_start:.2f}s | elapsed={(time.perf_counter() - start) / 60:.1f}m",
+                flush=True,
+            )
+
+    for policy in LEARNING_POLICY_NAMES:
+        for slot in range(WORKER_COUNT):
+            identity_rows.append(identity_summary_row(
+                states_by_policy[policy][slot], policy, condition, int(active[slot]), slot,
+                effective_horizon, "horizon_end", seed, model, true_model,
+            ))
+
+    return {
+        "round": pd.DataFrame(round_rows),
+        "monitor": pd.DataFrame(monitor_rows),
+        "candidate": pd.DataFrame(candidate_rows),
+        "identity": pd.DataFrame(identity_rows),
+        "runtime_seconds": float(time.perf_counter() - start),
+        "environment_seed": int(seed),
+    }
+
+
+# =============================================================================
+# 10. CHECKPOINTED EXECUTION
+# =============================================================================
+
+
+def checkpoint_path(condition_id, replication_index):
+    return CHECKPOINT_DIR / condition_id / f"rep_{int(replication_index):03d}"
+
+
+def save_job(result, path):
+    path.mkdir(parents=True, exist_ok=True)
+    result["round"].to_csv(path / "round.csv", index=False)
+    result["monitor"].to_csv(path / "monitor.csv", index=False)
+    result["candidate"].to_csv(path / "candidate.csv", index=False)
+    result["identity"].to_csv(path / "identity.csv", index=False)
+    with open(path / "done.json", "w", encoding="utf-8") as handle:
+        json.dump({
+            "runtime_seconds": result["runtime_seconds"],
+            "environment_seed": result["environment_seed"],
+        }, handle, indent=2)
+
+
+def read_optional_csv(path):
+    if not path.exists() or path.stat().st_size <= 1:
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def load_job(path):
+    return {
+        "round": pd.read_csv(path / "round.csv"),
+        "monitor": read_optional_csv(path / "monitor.csv"),
+        "candidate": read_optional_csv(path / "candidate.csv"),
+        "identity": pd.read_csv(path / "identity.csv"),
+    }
+
+
+def run_jobs():
+    total_jobs = len(CONDITIONS) * REPLICATION_COUNT_PER_CONDITION
+    completed = 0
+    overall_start = time.perf_counter()
+
+    for condition_index, condition in enumerate(CONDITIONS):
+        print("\n" + "-" * 78)
+        print(f"BUILD CONDITION {condition_index + 1}/{len(CONDITIONS)}: {condition['condition_id']}")
+        print(condition["description"])
+        model_start = time.perf_counter()
+        assumed_model = build_assumed_model(condition)
+        true_model = build_true_model(condition)
+        print(f"    condition models built in {time.perf_counter() - model_start:.1f}s", flush=True)
+
+        for replication_index in range(REPLICATION_COUNT_PER_CONDITION):
+            path = checkpoint_path(condition["condition_id"], replication_index)
+            if (path / "done.json").exists() and RESUME_FROM_CHECKPOINT:
+                completed += 1
+                print(
+                    f"[{completed}/{total_jobs}] skip completed | condition={condition['condition_id']} "
+                    f"rep={replication_index + 1}/{REPLICATION_COUNT_PER_CONDITION}",
+                    flush=True,
+                )
+                continue
+
+            print(
+                f"[{completed + 1}/{total_jobs}] start | condition={condition['condition_id']} "
+                f"rep={replication_index + 1}/{REPLICATION_COUNT_PER_CONDITION} "
+                f"seed={BASE_RANDOM_SEED + replication_index}",
+                flush=True,
+            )
+            result = run_one_environment(condition, replication_index, assumed_model, true_model)
+            save_job(result, path)
+            completed += 1
+            elapsed = time.perf_counter() - overall_start
+            eta = elapsed / completed * (total_jobs - completed)
+            print(
+                f"    complete in {result['runtime_seconds']:.1f}s | elapsed={elapsed / 60:.1f}m | ETA={eta / 60:.1f}m",
+                flush=True,
+            )
+
+        # Release scenario-specific joint likelihood caches before the next model.
+        assumed_model["joint_cache"].clear()
+        del assumed_model
+        del true_model
+        gc.collect()
+
+
+# =============================================================================
+# 11. AGGREGATION AND DIAGNOSTICS
+# =============================================================================
+
+
+def aggregate_jobs():
+    tables = {"round": [], "monitor": [], "candidate": [], "identity": []}
+    runtime_rows = []
+    for condition in CONDITIONS:
+        condition_id = condition["condition_id"]
+        for replication_index in range(REPLICATION_COUNT_PER_CONDITION):
+            path = checkpoint_path(condition_id, replication_index)
+            loaded = load_job(path)
+            for name in tables:
+                if len(loaded[name]):
+                    tables[name].append(loaded[name])
+            with open(path / "done.json", "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+            runtime_rows.append({
+                "condition_id": condition_id,
+                "category": condition["category"],
+                "severity": condition["severity"],
+                "replication_index": int(replication_index),
+                "environment_seed": int(meta["environment_seed"]),
+                "runtime_seconds": float(meta["runtime_seconds"]),
+            })
+    combined = {
+        name: pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        for name, frames in tables.items()
+    }
+    combined["runtime"] = pd.DataFrame(runtime_rows)
+    return combined
+
+
+def bootstrap_ci(values, repetitions=BOOTSTRAP_REPETITIONS, seed=BOOTSTRAP_SEED):
+    values = np.asarray(values, dtype=float)
+    if len(values) == 0:
+        return math.nan, math.nan
+    if len(values) == 1:
+        return float(values[0]), float(values[0])
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, len(values), size=(repetitions, len(values)))
+    means = values[indices].mean(axis=1)
+    return float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
+
+
+def build_summaries(tables):
+    round_df = tables["round"]
+    monitor_df = tables["monitor"]
+
+    replication = round_df.groupby(
+        ["condition_id", "category", "severity", "replication_index", "environment_seed", "policy"],
+        as_index=False,
+    ).agg(
+        cumulative_gross_expected_utility=("true_expected_utility", "sum"),
+        cumulative_net_expected_utility=("net_true_expected_utility", "sum"),
+        cumulative_gross_realized_utility=("realized_utility", "sum"),
+        cumulative_net_realized_utility=("net_realized_utility", "sum"),
+        monitoring_count=("monitored_worker_count", "sum"),
+        monitoring_rounds=("monitored_worker_count", lambda values: int(np.sum(np.asarray(values) > 0))),
+        multi_worker_monitoring_rounds=("multi_worker_monitoring", "sum"),
+        cumulative_oracle_utility=("oracle_expected_utility", "sum"),
+        cumulative_gross_regret=("gross_regret_to_oracle", "sum"),
+        decision_runtime_seconds=("decision_runtime_seconds", "sum"),
+    )
+
+    if len(monitor_df):
+        monitor_extra = monitor_df.groupby(
+            ["condition_id", "replication_index", "policy"], as_index=False
+        ).agg(
+            arrival_monitor_count=("arrival_round", "sum"),
+            unique_identities_monitored=("catalog_index", "nunique"),
+            mean_absolute_measurement_error=("observation_mode_error", lambda values: float(np.mean(np.abs(values)))),
+            actual_effort_deviation_rate=("behavior_deviation", "mean"),
+        )
+        replication = replication.merge(
+            monitor_extra,
+            on=["condition_id", "replication_index", "policy"],
+            how="left",
+        )
+
+    for column in (
+        "arrival_monitor_count",
+        "unique_identities_monitored",
+        "mean_absolute_measurement_error",
+        "actual_effort_deviation_rate",
+    ):
+        if column not in replication.columns:
+            replication[column] = 0.0
+        else:
+            replication[column] = replication[column].fillna(0.0)
+
+    aggregate = replication.groupby(["condition_id", "category", "severity", "policy"], as_index=False).agg(
+        replications=("replication_index", "nunique"),
+        mean_net_expected_utility=("cumulative_net_expected_utility", "mean"),
+        sd_net_expected_utility=("cumulative_net_expected_utility", "std"),
+        mean_gross_expected_utility=("cumulative_gross_expected_utility", "mean"),
+        mean_monitoring_count=("monitoring_count", "mean"),
+        mean_monitoring_rounds=("monitoring_rounds", "mean"),
+        mean_multi_worker_rounds=("multi_worker_monitoring_rounds", "mean"),
+        mean_arrival_monitor_count=("arrival_monitor_count", "mean"),
+        mean_oracle_regret=("cumulative_gross_regret", "mean"),
+        mean_decision_runtime_seconds=("decision_runtime_seconds", "mean"),
+    )
+
+    pairwise_rows = []
+    for condition in CONDITIONS:
+        condition_id = condition["condition_id"]
+        subset = replication[replication["condition_id"] == condition_id]
+        proposed = subset[subset["policy"] == "individual_evsi"].set_index("replication_index")
+        for baseline in BASELINE_NAMES:
+            base = subset[subset["policy"] == baseline].set_index("replication_index")
+            common = proposed.index.intersection(base.index)
+            differences = (
+                proposed.loc[common, "cumulative_net_expected_utility"].to_numpy(float)
+                - base.loc[common, "cumulative_net_expected_utility"].to_numpy(float)
+            )
+            low, high = bootstrap_ci(differences, seed=BOOTSTRAP_SEED + len(condition_id) + len(baseline))
+            pairwise_rows.append({
+                "condition_id": condition_id,
+                "category": condition["category"],
+                "severity": condition["severity"],
+                "baseline": baseline,
+                "n": int(len(differences)),
+                "mean_net_gain": float(np.mean(differences)),
+                "median_net_gain": float(np.median(differences)),
+                "bootstrap_95_low": low,
+                "bootstrap_95_high": high,
+                "wins": int(np.sum(differences > PAIRWISE_TIE_TOL)),
+                "ties": int(np.sum(np.abs(differences) <= PAIRWISE_TIE_TOL)),
+                "losses": int(np.sum(differences < -PAIRWISE_TIE_TOL)),
+            })
+    pairwise = pd.DataFrame(pairwise_rows)
+
+    mechanism_rows = []
+    outcome_rounds = round_df[round_df["policy"] == "outcome_only"].copy()
+    proposed_rounds = round_df[round_df["policy"] == "individual_evsi"].copy()
+    keys = ["condition_id", "replication_index", "adaptive_round"]
+    merged = proposed_rounds.merge(
+        outcome_rounds[keys + ["allocation", "true_expected_utility"]],
+        on=keys,
+        suffixes=("_evsi", "_outcome"),
+    )
+    for condition_id, group in merged.groupby("condition_id"):
+        changed = group["allocation_evsi"] != group["allocation_outcome"]
+        utility_change = group["true_expected_utility_evsi"] - group["true_expected_utility_outcome"]
+        beneficial = int(np.sum(changed & (utility_change > PAIRWISE_TIE_TOL)))
+        harmful = int(np.sum(changed & (utility_change < -PAIRWISE_TIE_TOL)))
+        mechanism_rows.append({
+            "condition_id": condition_id,
+            "rounds": int(len(group)),
+            "allocation_changed_rounds": int(np.sum(changed)),
+            "beneficial_changed_rounds": beneficial,
+            "harmful_changed_rounds": harmful,
+            "neutral_changed_rounds": int(np.sum(changed & (np.abs(utility_change) <= PAIRWISE_TIE_TOL))),
+            "beneficial_fraction_among_nonneutral_changes": (
+                beneficial / max(1, beneficial + harmful)
+            ),
+            "mean_true_utility_change_all_rounds": float(np.mean(utility_change)),
+        })
+    mechanism = pd.DataFrame(mechanism_rows)
+
+    # Compare each misspecified coordinator with the correctly specified
+    # reference under the same true environment and replication seed.
+    evsi_rep = replication[replication["policy"] == "individual_evsi"].copy()
+    robustness_rows = []
+    for condition in CONDITIONS:
+        condition_id = condition["condition_id"]
+        reference_id = condition["reference_condition_id"]
+        current = evsi_rep[evsi_rep["condition_id"] == condition_id].set_index("replication_index")
+        reference = evsi_rep[evsi_rep["condition_id"] == reference_id].set_index("replication_index")
+        common = reference.index.intersection(current.index)
+        deltas = (
+            current.loc[common, "cumulative_net_expected_utility"].to_numpy(float)
+            - reference.loc[common, "cumulative_net_expected_utility"].to_numpy(float)
+        )
+        robustness_rows.append({
+            "condition_id": condition_id,
+            "reference_condition_id": reference_id,
+            "category": condition["category"],
+            "severity": condition["severity"],
+            "n": int(len(deltas)),
+            "mean_evsi_net_utility_change_vs_correct_model": float(np.mean(deltas)),
+            "minimum_evsi_net_utility_change_vs_correct_model": float(np.min(deltas)),
+            "maximum_evsi_net_utility_change_vs_correct_model": float(np.max(deltas)),
+        })
+    robustness = pd.DataFrame(robustness_rows)
+
+    condition_gate_rows = []
+    for condition in CONDITIONS:
+        condition_id = condition["condition_id"]
+        row = pairwise[(pairwise["condition_id"] == condition_id) & (pairwise["baseline"] == "outcome_only")].iloc[0]
+        agg = aggregate[(aggregate["condition_id"] == condition_id) & (aggregate["policy"] == "individual_evsi")].iloc[0]
+        mechanism_row = mechanism[mechanism["condition_id"] == condition_id].iloc[0]
+        condition_gate_rows.extend([
+            {
+                "condition_id": condition_id,
+                "criterion": "evsi_mean_net_gain_vs_outcome_positive",
+                "value": float(row["mean_net_gain"]),
+                "pass": bool(row["mean_net_gain"] > 0.0),
+            },
+            {
+                "condition_id": condition_id,
+                "criterion": "evsi_bootstrap_lower_bound_vs_outcome_positive",
+                "value": float(row["bootstrap_95_low"]),
+                "pass": bool(row["bootstrap_95_low"] > 0.0),
+            },
+            {
+                "condition_id": condition_id,
+                "criterion": "monitoring_nontrivial",
+                "value": float(agg["mean_monitoring_count"]),
+                "pass": bool(0.0 < agg["mean_monitoring_count"] < ADAPTIVE_HORIZON * WORKER_COUNT),
+            },
+            {
+                "condition_id": condition_id,
+                "criterion": "beneficial_fraction_at_least_half",
+                "value": float(mechanism_row["beneficial_fraction_among_nonneutral_changes"]),
+                "pass": bool(mechanism_row["beneficial_fraction_among_nonneutral_changes"] >= 0.5),
+            },
+        ])
+    condition_gate = pd.DataFrame(condition_gate_rows)
+
+    return replication, aggregate, pairwise, mechanism, robustness, condition_gate
+
+
+# =============================================================================
+# 12. EXECUTION, OUTPUTS, AND AUTOMATIC DOWNLOAD
+# =============================================================================
+
+print("=" * 78)
+print("V10D3 SIGNAL-MODEL MISSPECIFICATION CONFIRMATION")
+print("=" * 78)
+print(f"Fixed grid points: {GRID_SIZE} ({GRID['n_x']} x {GRID['n_z']})")
+print(f"Conditions: {len(CONDITIONS)}")
+print(f"Paired seeds per condition: {REPLICATION_COUNT_PER_CONDITION}")
+print(f"Total environment jobs: {len(CONDITIONS) * REPLICATION_COUNT_PER_CONDITION}")
+print(f"Locked monitoring cost: {MONITORING_COST:.10g}")
+print("No cumulative monitoring budget; exact 21-level effort representation is retained.")
+
+run_jobs()
+tables = aggregate_jobs()
+replication_df, aggregate_df, pairwise_df, mechanism_df, robustness_df, condition_gate_df = build_summaries(tables)
+
+condition_df = pd.DataFrame(CONDITIONS)
+
+# Numerical checks.
+candidate_df = tables["candidate"]
+round_df = tables["round"]
+identity_df = tables["identity"]
+checks = [
+    {
+        "check": "minimum_individual_gross_evsi",
+        "value": float(candidate_df["gross_evsi"].min()) if len(candidate_df) else 0.0,
+        "tolerance": -NONNEGATIVITY_TOLERANCE,
+        "pass": bool((candidate_df["gross_evsi"].min() if len(candidate_df) else 0.0) >= -NONNEGATIVITY_TOLERANCE),
+    },
+    {
+        "check": "maximum_branch_probability_sum_error",
+        "value": float(candidate_df["probability_sum_error"].max()) if len(candidate_df) else 0.0,
+        "tolerance": NORMALIZATION_TOLERANCE,
+        "pass": bool((candidate_df["probability_sum_error"].max() if len(candidate_df) else 0.0) <= NORMALIZATION_TOLERANCE),
+    },
+    {
+        "check": "minimum_posterior_update_normalizer",
+        "value": float(identity_df["minimum_update_normalizer"].min()),
+        "tolerance": 0.0,
+        "pass": bool(identity_df["minimum_update_normalizer"].min() > 0.0),
+    },
+    {
+        "check": "all_allocations_sum_to_workload",
+        "value": int(round_df["allocation"].map(lambda text: sum(int(value) for value in str(text).split("|"))).eq(TOTAL_WORKLOAD).sum()),
+        "tolerance": int(len(round_df)),
+        "pass": bool(round_df["allocation"].map(lambda text: sum(int(value) for value in str(text).split("|"))).eq(TOTAL_WORKLOAD).all()),
+    },
+]
+checks_df = pd.DataFrame(checks)
+
+# Save tables.
+outputs = [
+    ("01_condition_definitions.csv", condition_df),
+    ("02_round_level_results.csv", tables["round"]),
+    ("03_monitoring_events.csv", tables["monitor"]),
+    ("04_individual_evsi_candidates.csv", tables["candidate"]),
+    ("05_identity_posterior_summaries.csv", tables["identity"]),
+    ("06_environment_runtime.csv", tables["runtime"]),
+    ("07_replication_policy_summary.csv", replication_df),
+    ("08_condition_policy_summary.csv", aggregate_df),
+    ("09_evsi_paired_comparisons.csv", pairwise_df),
+    ("10_mechanism_summary.csv", mechanism_df),
+    ("11_misspecification_change_vs_correct.csv", robustness_df),
+    ("12_condition_decision_gate.csv", condition_gate_df),
+    ("13_numerical_checks.csv", checks_df),
+]
+for filename, dataframe in outputs:
+    dataframe.to_csv(OUTPUT_DIR / filename, index=False)
+
+config = {
+    "script_label": SCRIPT_LABEL,
+    "focused_misspecification_confirmation": True,
+    "replication_count_per_condition": REPLICATION_COUNT_PER_CONDITION,
+    "condition_count": len(CONDITIONS),
+    "total_environment_jobs": len(CONDITIONS) * REPLICATION_COUNT_PER_CONDITION,
+    "worker_count": WORKER_COUNT,
+    "total_workload": TOTAL_WORKLOAD,
+    "adaptive_horizon": ADAPTIVE_HORIZON,
+    "warmup_rounds": WARMUP_ROUNDS,
+    "monitoring_cost": MONITORING_COST,
+    "policies": list(POLICY_NAMES),
+    "no_cumulative_monitoring_budget": True,
+    "individual_evsi_thresholding": True,
+    "joint_monitoring_interactions_ignored": True,
+    "effort_mode_count": EFFORT_MODE_COUNT,
+    "grid_size": GRID_SIZE,
+    "grid_bounds": GRID["bounds"],
+    "grid_log_spacing": GRID_LOG_SPACING,
+    "grid_marginal_prior_mass": GRID_MARGINAL_PRIOR_MASS,
+    "numerical_behavior_floor": NUMERICAL_BEHAVIOR_FLOOR,
+    "numerical_observation_floor": NUMERICAL_OBSERVATION_FLOOR,
+    "joint_cache_max_workloads": JOINT_CACHE_MAX_WORKLOADS,
+    "conditions": CONDITIONS,
+}
+with open(OUTPUT_DIR / "00_configuration.json", "w", encoding="utf-8") as handle:
+    json.dump(config, handle, indent=2)
+
+# Figures.
+condition_order = [condition["condition_id"] for condition in CONDITIONS]
+labels = [condition_id.replace("_", "\n") for condition_id in condition_order]
+
+outcome_comparisons = pairwise_df[pairwise_df["baseline"] == "outcome_only"].set_index("condition_id").reindex(condition_order)
+plt.figure(figsize=(12, 6))
+plt.bar(np.arange(len(condition_order)), outcome_comparisons["mean_net_gain"].to_numpy(float))
+plt.axhline(0.0, linewidth=1)
+plt.xticks(np.arange(len(condition_order)), labels, rotation=0, fontsize=8)
+plt.ylabel("EVSI minus outcome-only net utility")
+plt.title("Signal-Model Misspecification: Net Gain over Outcome-Only")
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figure_01_evsi_gain_vs_outcome_by_condition.png", dpi=180)
+plt.close()
+
+monitoring = aggregate_df[aggregate_df["policy"] == "individual_evsi"].set_index("condition_id").reindex(condition_order)
+plt.figure(figsize=(12, 6))
+plt.bar(np.arange(len(condition_order)), monitoring["mean_monitoring_count"].to_numpy(float))
+plt.xticks(np.arange(len(condition_order)), labels, rotation=0, fontsize=8)
+plt.ylabel("Mean monitored worker observations")
+plt.title("EVSI Monitoring Count by Signal-Model Assumption")
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figure_02_evsi_monitoring_count_by_condition.png", dpi=180)
+plt.close()
+
+# Outcome-to-oracle gap closure.
+pivot = aggregate_df.pivot(index="condition_id", columns="policy", values="mean_net_expected_utility").reindex(condition_order)
+denominator = pivot["oracle_dynamic"] - pivot["outcome_only"]
+gap_closure = (pivot["individual_evsi"] - pivot["outcome_only"]) / denominator.replace(0.0, np.nan)
+plt.figure(figsize=(12, 6))
+plt.bar(np.arange(len(condition_order)), 100.0 * gap_closure.to_numpy(float))
+plt.axhline(0.0, linewidth=1)
+plt.xticks(np.arange(len(condition_order)), labels, rotation=0, fontsize=8)
+plt.ylabel("Outcome-to-oracle gap closed (%)")
+plt.title("EVSI Oracle-Gap Closure under Signal-Model Misspecification")
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figure_03_evsi_oracle_gap_closure.png", dpi=180)
+plt.close()
+
+# Monitoring efficiency relative to uncertainty.
+uncertainty = aggregate_df[aggregate_df["policy"] == "uncertainty_proxy"].set_index("condition_id").reindex(condition_order)
+evsi = aggregate_df[aggregate_df["policy"] == "individual_evsi"].set_index("condition_id").reindex(condition_order)
+plt.figure(figsize=(12, 6))
+positions = np.arange(len(condition_order))
+width = 0.38
+plt.bar(positions - width / 2, evsi["mean_monitoring_count"].to_numpy(float), width=width, label="individual_evsi")
+plt.bar(positions + width / 2, uncertainty["mean_monitoring_count"].to_numpy(float), width=width, label="uncertainty_proxy")
+plt.xticks(positions, labels, rotation=0, fontsize=8)
+plt.ylabel("Mean monitored worker observations")
+plt.title("Monitoring Use: EVSI versus Uncertainty")
+plt.legend()
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figure_04_monitoring_efficiency.png", dpi=180)
+plt.close()
+
+# Text summary.
+summary_lines = [
+    "TASK 4 V10D3: SIGNAL-MODEL MISSPECIFICATION CONFIRMATION",
+    "",
+    "Purpose:",
+    "Test the locked individual one-step EVSI policy when the coordinator",
+    "underestimates or ignores 30% behavioral randomness or 30% monitoring",
+    "measurement error. Each misspecified condition is paired against a",
+    "correctly specified reference under the same true environment and seeds.",
+    "",
+    f"Paired seeds per condition: {REPLICATION_COUNT_PER_CONDITION}",
+    f"Total environment jobs: {len(CONDITIONS) * REPLICATION_COUNT_PER_CONDITION}",
+    f"Locked monitoring cost: {MONITORING_COST:.10g}",
+    f"Fixed posterior grid points: {GRID_SIZE}",
+    "",
+    "IMPORTANT:",
+    "This suite isolates signal-model misspecification. It does not test wrong",
+    "success links, wrong beta, wrong effort-cost functions, or prior-support",
+    "misspecification, which remain separate structural robustness questions.",
+    "",
+    "EVSI paired comparisons against outcome-only:",
+    outcome_comparisons.reset_index().to_string(index=False),
+    "",
+    "EVSI change relative to the correctly specified signal model:",
+    robustness_df.to_string(index=False),
+    "",
+    "Mechanism summary:",
+    mechanism_df.to_string(index=False),
+    "",
+    "Condition decision gates:",
+    condition_gate_df.to_string(index=False),
+    "",
+    "Numerical checks:",
+    checks_df.to_string(index=False),
+]
+with open(OUTPUT_DIR / "14_summary.txt", "w", encoding="utf-8") as handle:
+    handle.write("\n".join(summary_lines))
+
+# ZIP excludes checkpoint internals.
+with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for path in sorted(OUTPUT_DIR.rglob("*")):
+        if path.is_file() and "checkpoints" not in path.parts:
+            archive.write(path, arcname=path.relative_to(OUTPUT_DIR))
+
+print("\nEVSI comparisons against outcome-only:")
+display(outcome_comparisons.reset_index())
+print("\nMisspecification change versus correctly specified reference:")
+display(robustness_df)
+print("\nNumerical checks:")
+display(checks_df)
+print(f"\nOutput directory: {OUTPUT_DIR}")
+print(f"ZIP archive: {ZIP_PATH}")
+print("V10D3 COMPLETE")
+
+# Automatically download the ZIP in Google Colab.
+try:
+    from google.colab import files
+    files.download(str(ZIP_PATH))
+except Exception as error:
+    print(f"Automatic download skipped: {error}")

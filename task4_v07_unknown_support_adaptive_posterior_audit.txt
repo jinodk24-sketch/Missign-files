@@ -1,0 +1,3524 @@
+# Task 4, Version 07: Unknown-Support Adaptive Posterior Audit
+# =====================================================================
+#
+# PURPOSE
+# -------
+# Version 06 verified numerical convergence only inside a predeclared
+# parameter rectangle. That is not sufficient for a deployed method because
+# the learner does not know the true minimum and maximum worker capacity or
+# resource aversion.
+#
+# Version 07 removes that assumption.
+#
+# The worker parameters remain positive and conceptually unbounded:
+#
+#     C > 0,
+#     lambda > 0.
+#
+# We transform them to unconstrained log coordinates:
+#
+#     x = log(C / I_ref),
+#     z = log(lambda / b).
+#
+# A broad Student-t prior is placed on (x, z). The numerical grid is initialized
+# from a central prior-probability region, not from the true parameter range.
+# During inference, the grid expands when:
+#
+#   1. exact effort observations leave no compatible numerical support; or
+#   2. posterior mass accumulates near one or more grid boundaries.
+#
+# The grid spacing is preserved as the region expands, so expansion increases
+# the number of numerical integration points instead of silently making the
+# approximation coarser.
+#
+# SCIENTIFIC QUESTION
+# -------------------
+# Can effort-aware Bayesian prediction remain accurate when the learner is not
+# given true parameter bounds?
+#
+# COMPARISONS
+# -----------
+# For each prior scale, true worker, and exact binary outcome sequence:
+#
+#   fixed_33:
+#       33 x 33 log-parameter grid initialized from the prior and never expanded.
+#
+#   adaptive_33:
+#       same initial 33 x 33 grid, but expands based only on posterior diagnostics.
+#
+#   reference_65:
+#       same adaptive rule with a finer 65 x 65 initial resolution, a stricter
+#       boundary threshold, and a larger computational budget. This is a
+#       numerical reference, not an analytic ground truth.
+#
+# Each approximation is evaluated with:
+#
+#   outcome_only:
+#       workloads and binary outcomes.
+#
+#   exact_spread2:
+#       the same outcomes plus exact effort observations in rounds 1 and 3,
+#       corresponding to workloads 6 and 8.
+#
+# PRIOR-SCALE SENSITIVITY
+# -----------------------
+# The script tests moderately broad, broad, and very broad Student-t priors.
+# All priors are unbounded. Their numerical initial regions are constructed
+# from the same central marginal prior mass.
+#
+# TRUE WORKERS
+# ------------
+# The deterministic evaluation workers include:
+#
+#   - workers comfortably inside the moderate initial region;
+#   - workers near that region's numerical boundary;
+#   - workers outside the moderate initial region;
+#   - extreme workers intended to test expansion and prior sensitivity.
+#
+# These labels are used only for evaluation. The learner does not receive them.
+#
+# IMPORTANT
+# ---------
+# Capacity and resource aversion are continuous. Effort remains discrete:
+#
+#     E = {0, 0.05, ..., 1.00}.
+#
+# The script exactly enumerates all 2^5 binary outcome sequences. No Monte Carlo
+# seed is used.
+#
+# OUTPUT
+# ------
+# The script creates a ZIP containing all CSV tables, configuration, summary,
+# and figures. It prints percent progress, elapsed time, and ETA.
+#
+# Paste this entire file into one Google Colab cell and run it.
+
+
+import json
+import math
+import shutil
+import time
+import zipfile
+from collections import OrderedDict, defaultdict
+from itertools import product
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from IPython.display import display
+from scipy.stats import t as student_t_distribution
+
+
+# =====================================================================
+# 1. CONFIGURATION
+# =====================================================================
+
+SCRIPT_LABEL = "task4_v07_unknown_support_adaptive_posterior_audit"
+
+BETA = 8.0
+PAYMENT_PER_UNIT = 1.0
+
+EFFORT_STEP = 0.05
+EFFORT_GRID = np.round(
+    np.arange(0.0, 1.0 + EFFORT_STEP / 2.0, EFFORT_STEP),
+    10,
+)
+
+ALL_WORKLOADS = np.arange(4, 17, 1, dtype=float)
+TRAINING_WORKLOAD_SEQUENCE = np.array([6, 7, 8, 7, 6], dtype=float)
+HORIZON = len(TRAINING_WORKLOAD_SEQUENCE)
+
+HELDOUT_NEAR_WORKLOADS = np.array([4, 5, 9, 10], dtype=float)
+HELDOUT_FULL_WORKLOADS = np.array(
+    [4, 5, 9, 10, 11, 12, 13, 14, 15, 16],
+    dtype=float,
+)
+
+MONITORED_ROUNDS = [1, 3]
+MONITORED_WORKLOADS = [
+    int(TRAINING_WORKLOAD_SEQUENCE[index - 1])
+    for index in MONITORED_ROUNDS
+]
+
+METHOD_NAMES = [
+    "outcome_only",
+    "exact_spread2",
+]
+
+# Known scaling constants used only to make transformed parameters dimensionless.
+# They are prior reference scales, not true population bounds.
+I_REFERENCE = 7.0
+PRIOR_MEDIAN_CAPACITY = 12.0
+PRIOR_MEDIAN_LAMBDA = 0.8
+
+PRIOR_DF = 3.0
+
+PRIOR_DEFINITIONS = [
+    {
+        "prior_name": "moderately_broad",
+        "x_scale": 0.20,
+        "z_scale": 0.20,
+    },
+    {
+        "prior_name": "broad",
+        "x_scale": 0.35,
+        "z_scale": 0.35,
+    },
+    {
+        "prior_name": "very_broad",
+        "x_scale": 0.50,
+        "z_scale": 0.50,
+    },
+]
+
+# The initial numerical region contains this central probability mass in each
+# one-dimensional marginal prior. It is determined from the prior, not truth.
+INITIAL_MARGINAL_PRIOR_MASS = 0.975
+
+APPROXIMATION_DEFINITIONS = [
+    {
+        "approximation": "reference_65",
+        "initial_points_per_dimension": 65,
+        "adaptive": True,
+        "boundary_mass_threshold": 0.005,
+        "boundary_layers": 2,
+        "max_expansion_events": 10,
+        "max_grid_points": 120000,
+        "is_reference": True,
+    },
+    {
+        "approximation": "fixed_33",
+        "initial_points_per_dimension": 33,
+        "adaptive": False,
+        "boundary_mass_threshold": math.nan,
+        "boundary_layers": 2,
+        "max_expansion_events": 0,
+        "max_grid_points": 50000,
+        "is_reference": False,
+    },
+    {
+        "approximation": "adaptive_33",
+        "initial_points_per_dimension": 33,
+        "adaptive": True,
+        "boundary_mass_threshold": 0.020,
+        "boundary_layers": 2,
+        "max_expansion_events": 8,
+        "max_grid_points": 50000,
+        "is_reference": False,
+    },
+]
+
+REFERENCE_APPROXIMATION = "reference_65"
+
+# Each expansion adds this fraction of the current span to an indicated side.
+# Expanding all four sides therefore multiplies each total span by 1.5.
+EXPANSION_SIDE_FRACTION = 0.25
+
+# Hard numerical guard in log coordinates. exp(12) is already enormous relative
+# to the workload scale, so reaching this guard indicates a failed adaptation.
+HARD_LOG_ABS_BOUND = 12.0
+
+# Fixed deterministic true workers. These values are never passed to inference.
+TRUE_WORKER_DEFINITIONS = [
+    {
+        "true_type_id": "inside_01",
+        "test_category": "inside_moderate",
+        "capacity": 8.5,
+        "lambda": 0.55,
+    },
+    {
+        "true_type_id": "inside_02",
+        "test_category": "inside_moderate",
+        "capacity": 12.3,
+        "lambda": 0.82,
+    },
+    {
+        "true_type_id": "inside_03",
+        "test_category": "inside_moderate",
+        "capacity": 18.5,
+        "lambda": 1.25,
+    },
+    {
+        "true_type_id": "near_01",
+        "test_category": "near_moderate_boundary",
+        "capacity": 5.5,
+        "lambda": 0.38,
+    },
+    {
+        "true_type_id": "near_02",
+        "test_category": "near_moderate_boundary",
+        "capacity": 26.0,
+        "lambda": 1.70,
+    },
+    {
+        "true_type_id": "near_03",
+        "test_category": "near_moderate_boundary",
+        "capacity": 6.0,
+        "lambda": 1.70,
+    },
+    {
+        "true_type_id": "near_04",
+        "test_category": "near_moderate_boundary",
+        "capacity": 26.0,
+        "lambda": 0.38,
+    },
+    {
+        "true_type_id": "outside_01",
+        "test_category": "outside_moderate",
+        "capacity": 3.2,
+        "lambda": 0.22,
+    },
+    {
+        "true_type_id": "outside_02",
+        "test_category": "outside_moderate",
+        "capacity": 45.0,
+        "lambda": 2.80,
+    },
+    {
+        "true_type_id": "outside_03",
+        "test_category": "outside_moderate",
+        "capacity": 40.0,
+        "lambda": 0.22,
+    },
+    {
+        "true_type_id": "outside_04",
+        "test_category": "outside_moderate",
+        "capacity": 3.2,
+        "lambda": 2.80,
+    },
+    {
+        "true_type_id": "extreme_01",
+        "test_category": "extreme",
+        "capacity": 75.0,
+        "lambda": 4.80,
+    },
+]
+
+# Numerical settings.
+ARGMAX_TOL = 1e-12
+PROBABILITY_CLIP = 1e-12
+SEQUENCE_PROBABILITY_SKIP = 1e-18
+METRIC_TIE_TOL = 1e-12
+COLLAPSE_RMSE_PENALTY = 1.0
+
+# Grid response cache. This stores only recently used numerical grids.
+GRID_CACHE_MAX_ENTRIES = 16
+
+# Provisional engineering screens.
+REFERENCE_CURVE_RMSE_TOLERANCE = 0.015
+ADAPTIVE_COLLAPSE_TOLERANCE = 0.01
+PRIOR_SCALE_RMSE_RANGE_TOLERANCE = 0.03
+
+OUTPUT_ROOT = Path("/content") if Path("/content").exists() else Path.cwd()
+OUTPUT_DIR = OUTPUT_ROOT / f"{SCRIPT_LABEL}_outputs"
+ZIP_PATH = OUTPUT_ROOT / f"{SCRIPT_LABEL}_outputs.zip"
+
+
+# =====================================================================
+# 2. VALIDATION
+# =====================================================================
+
+def validate_configuration():
+    assert BETA > 0.0
+    assert PAYMENT_PER_UNIT > 0.0
+    assert I_REFERENCE > 0.0
+    assert PRIOR_MEDIAN_CAPACITY > 0.0
+    assert PRIOR_MEDIAN_LAMBDA > 0.0
+    assert PRIOR_DF > 0.0
+
+    assert np.isclose(EFFORT_GRID[0], 0.0)
+    assert np.isclose(EFFORT_GRID[-1], 1.0)
+    assert np.all(np.diff(EFFORT_GRID) > 0.0)
+
+    assert len(TRAINING_WORKLOAD_SEQUENCE) == 5
+    assert all(1 <= value <= HORIZON for value in MONITORED_ROUNDS)
+
+    assert set(HELDOUT_NEAR_WORKLOADS.tolist()).isdisjoint(
+        set(TRAINING_WORKLOAD_SEQUENCE.tolist())
+    )
+
+    assert 0.0 < INITIAL_MARGINAL_PRIOR_MASS < 1.0
+    assert 0.0 < EXPANSION_SIDE_FRACTION < 1.0
+
+    approximation_names = [
+        item["approximation"]
+        for item in APPROXIMATION_DEFINITIONS
+    ]
+
+    assert len(approximation_names) == len(set(approximation_names))
+    assert REFERENCE_APPROXIMATION in approximation_names
+    assert sum(item["is_reference"] for item in APPROXIMATION_DEFINITIONS) == 1
+
+    prior_names = [item["prior_name"] for item in PRIOR_DEFINITIONS]
+    assert len(prior_names) == len(set(prior_names))
+
+    true_ids = [item["true_type_id"] for item in TRUE_WORKER_DEFINITIONS]
+    assert len(true_ids) == len(set(true_ids))
+
+    assert all(item["capacity"] > 0.0 for item in TRUE_WORKER_DEFINITIONS)
+    assert all(item["lambda"] > 0.0 for item in TRUE_WORKER_DEFINITIONS)
+
+
+validate_configuration()
+
+
+# =====================================================================
+# 3. OUTPUT DIRECTORY
+# =====================================================================
+
+if OUTPUT_DIR.exists():
+    shutil.rmtree(OUTPUT_DIR)
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+
+# =====================================================================
+# 4. FORWARD MODEL
+# =====================================================================
+
+def stable_sigmoid(x):
+    """Numerically stable logistic sigmoid."""
+    x = np.asarray(x, dtype=float)
+    output = np.empty_like(x)
+
+    nonnegative = x >= 0.0
+    output[nonnegative] = 1.0 / (
+        1.0 + np.exp(-x[nonnegative])
+    )
+
+    exp_x = np.exp(x[~nonnegative])
+    output[~nonnegative] = exp_x / (1.0 + exp_x)
+
+    return output
+
+
+def success_probability(effort, load_ratio):
+    """
+    Locked success model.
+
+    p(0, rho) = 0
+    p(e, rho) = sigmoid(beta * (e - rho)) for e > 0.
+    """
+    effort = np.asarray(effort, dtype=float)
+    positive_probability = stable_sigmoid(
+        BETA * (effort - load_ratio)
+    )
+
+    return np.where(
+        effort <= 0.0,
+        0.0,
+        positive_probability,
+    )
+
+
+def choose_optimal_effort(workload, capacity, resource_aversion):
+    """
+    Deterministic best response with lowest-effort tie-breaking.
+    """
+    load_ratio = workload / capacity
+
+    probabilities = success_probability(
+        EFFORT_GRID,
+        load_ratio,
+    )
+
+    utilities = (
+        PAYMENT_PER_UNIT * probabilities
+        - resource_aversion * EFFORT_GRID**2
+    )
+
+    maximum_utility = float(np.max(utilities))
+    maximizing_indices = np.flatnonzero(
+        np.isclose(
+            utilities,
+            maximum_utility,
+            atol=ARGMAX_TOL,
+            rtol=0.0,
+        )
+    )
+
+    best_index = int(maximizing_indices[0])
+
+    return (
+        float(EFFORT_GRID[best_index]),
+        float(probabilities[best_index]),
+        maximum_utility,
+    )
+
+
+def compute_forward_matrices(capacity_vector, lambda_vector):
+    """
+    Vectorized worker behavior for every workload and numerical grid point.
+    """
+    capacity_vector = np.asarray(capacity_vector, dtype=float)
+    lambda_vector = np.asarray(lambda_vector, dtype=float)
+
+    candidate_count = len(capacity_vector)
+
+    effort_matrix = np.zeros(
+        (len(ALL_WORKLOADS), candidate_count),
+        dtype=np.float32,
+    )
+
+    probability_matrix = np.zeros(
+        (len(ALL_WORKLOADS), candidate_count),
+        dtype=float,
+    )
+
+    effort_column = EFFORT_GRID[:, None]
+    effort_squared_column = effort_column**2
+
+    for workload_index, workload in enumerate(ALL_WORKLOADS):
+        load_ratio_row = (
+            workload / capacity_vector
+        )[None, :]
+
+        probabilities = stable_sigmoid(
+            BETA * (effort_column - load_ratio_row)
+        )
+
+        probabilities[0, :] = 0.0
+
+        utilities = (
+            PAYMENT_PER_UNIT * probabilities
+            - lambda_vector[None, :] * effort_squared_column
+        )
+
+        # np.argmax returns the first maximizer, implementing lowest-effort
+        # tie-breaking because EFFORT_GRID is increasing.
+        best_indices = np.argmax(utilities, axis=0)
+
+        effort_matrix[workload_index, :] = EFFORT_GRID[
+            best_indices
+        ]
+
+        probability_matrix[workload_index, :] = probabilities[
+            best_indices,
+            np.arange(candidate_count),
+        ]
+
+    return effort_matrix, probability_matrix
+
+
+# =====================================================================
+# 5. TRANSFORMED PRIOR
+# =====================================================================
+
+X_PRIOR_LOCATION = math.log(
+    PRIOR_MEDIAN_CAPACITY / I_REFERENCE
+)
+
+Z_PRIOR_LOCATION = math.log(
+    PRIOR_MEDIAN_LAMBDA / PAYMENT_PER_UNIT
+)
+
+
+def student_t_log_density(value, location, scale):
+    """
+    Log density of a location-scale Student-t distribution.
+    """
+    standardized = (value - location) / scale
+
+    constant = (
+        math.lgamma((PRIOR_DF + 1.0) / 2.0)
+        - math.lgamma(PRIOR_DF / 2.0)
+        - 0.5 * math.log(PRIOR_DF * math.pi)
+        - math.log(scale)
+    )
+
+    return (
+        constant
+        - ((PRIOR_DF + 1.0) / 2.0)
+        * np.log1p((standardized**2) / PRIOR_DF)
+    )
+
+
+def initial_log_bounds(prior_definition):
+    """
+    Initial numerical bounds from central marginal prior mass.
+
+    No true parameter range is used.
+    """
+    lower_tail = (
+        1.0 - INITIAL_MARGINAL_PRIOR_MASS
+    ) / 2.0
+
+    upper_tail = 1.0 - lower_tail
+
+    lower_quantile = float(
+        student_t_distribution.ppf(
+            lower_tail,
+            df=PRIOR_DF,
+        )
+    )
+
+    upper_quantile = float(
+        student_t_distribution.ppf(
+            upper_tail,
+            df=PRIOR_DF,
+        )
+    )
+
+    x_lower = (
+        X_PRIOR_LOCATION
+        + prior_definition["x_scale"] * lower_quantile
+    )
+
+    x_upper = (
+        X_PRIOR_LOCATION
+        + prior_definition["x_scale"] * upper_quantile
+    )
+
+    z_lower = (
+        Z_PRIOR_LOCATION
+        + prior_definition["z_scale"] * lower_quantile
+    )
+
+    z_upper = (
+        Z_PRIOR_LOCATION
+        + prior_definition["z_scale"] * upper_quantile
+    )
+
+    return {
+        "x_lower": float(x_lower),
+        "x_upper": float(x_upper),
+        "z_lower": float(z_lower),
+        "z_upper": float(z_upper),
+    }
+
+
+def log_bounds_to_original(bounds):
+    return {
+        "capacity_lower": float(
+            I_REFERENCE * math.exp(bounds["x_lower"])
+        ),
+        "capacity_upper": float(
+            I_REFERENCE * math.exp(bounds["x_upper"])
+        ),
+        "lambda_lower": float(
+            PAYMENT_PER_UNIT * math.exp(bounds["z_lower"])
+        ),
+        "lambda_upper": float(
+            PAYMENT_PER_UNIT * math.exp(bounds["z_upper"])
+        ),
+    }
+
+
+# =====================================================================
+# 6. WORKLOAD INDEXING
+# =====================================================================
+
+WORKLOAD_TO_INDEX = {
+    float(workload): index
+    for index, workload in enumerate(ALL_WORKLOADS)
+}
+
+TRAINING_WORKLOAD_INDICES = np.array(
+    [
+        WORKLOAD_TO_INDEX[float(workload)]
+        for workload in TRAINING_WORKLOAD_SEQUENCE
+    ],
+    dtype=int,
+)
+
+EVALUATION_SETS = {
+    "heldout_near": HELDOUT_NEAR_WORKLOADS,
+    "heldout_full": HELDOUT_FULL_WORKLOADS,
+    "all_workloads": ALL_WORKLOADS,
+}
+
+EVALUATION_INDICES = {
+    name: np.array(
+        [
+            WORKLOAD_TO_INDEX[float(value)]
+            for value in workloads
+        ],
+        dtype=int,
+    )
+    for name, workloads in EVALUATION_SETS.items()
+}
+
+
+# =====================================================================
+# 7. TRUE WORKER DATA
+# =====================================================================
+
+true_worker_rows = []
+true_worker_runtime = {}
+
+for definition in TRUE_WORKER_DEFINITIONS:
+    capacity = float(definition["capacity"])
+    resource_aversion = float(definition["lambda"])
+
+    effort_curve = np.zeros(
+        len(ALL_WORKLOADS),
+        dtype=float,
+    )
+
+    probability_curve = np.zeros(
+        len(ALL_WORKLOADS),
+        dtype=float,
+    )
+
+    for workload_index, workload in enumerate(ALL_WORKLOADS):
+        effort, probability, _ = choose_optimal_effort(
+            workload,
+            capacity,
+            resource_aversion,
+        )
+
+        effort_curve[workload_index] = effort
+        probability_curve[workload_index] = probability
+
+    training_efforts = effort_curve[
+        TRAINING_WORKLOAD_INDICES
+    ]
+
+    training_probabilities = probability_curve[
+        TRAINING_WORKLOAD_INDICES
+    ]
+
+    x_true = math.log(capacity / I_REFERENCE)
+    z_true = math.log(
+        resource_aversion / PAYMENT_PER_UNIT
+    )
+
+    true_worker_rows.append(
+        {
+            **definition,
+            "x_true": x_true,
+            "z_true": z_true,
+            "training_effort_signature": "|".join(
+                f"{value:.2f}"
+                for value in training_efforts
+            ),
+            "training_probability_signature": "|".join(
+                f"{value:.8f}"
+                for value in training_probabilities
+            ),
+        }
+    )
+
+    true_worker_runtime[
+        definition["true_type_id"]
+    ] = {
+        "effort_curve": effort_curve,
+        "probability_curve": probability_curve,
+        "training_efforts": training_efforts,
+        "training_probabilities": training_probabilities,
+    }
+
+true_workers_df = pd.DataFrame(true_worker_rows)
+TRUE_WORKER_COUNT = len(true_workers_df)
+
+
+# =====================================================================
+# 8. PRIOR INITIAL-REGION TABLE
+# =====================================================================
+
+prior_region_rows = []
+
+for prior_definition in PRIOR_DEFINITIONS:
+    bounds = initial_log_bounds(prior_definition)
+    original = log_bounds_to_original(bounds)
+
+    prior_region_rows.append(
+        {
+            "prior_name": prior_definition["prior_name"],
+            "x_scale": prior_definition["x_scale"],
+            "z_scale": prior_definition["z_scale"],
+            "initial_marginal_prior_mass": (
+                INITIAL_MARGINAL_PRIOR_MASS
+            ),
+            **bounds,
+            **original,
+        }
+    )
+
+prior_regions_df = pd.DataFrame(prior_region_rows)
+
+
+# =====================================================================
+# 9. GRID CACHE AND CONSTRUCTION
+# =====================================================================
+
+GRID_CACHE = OrderedDict()
+
+
+def grid_cache_key(
+    bounds,
+    target_dx,
+    target_dz,
+    max_grid_points,
+):
+    return (
+        round(bounds["x_lower"], 12),
+        round(bounds["x_upper"], 12),
+        round(bounds["z_lower"], 12),
+        round(bounds["z_upper"], 12),
+        round(target_dx, 12),
+        round(target_dz, 12),
+        int(max_grid_points),
+    )
+
+
+def build_grid_payload(
+    bounds,
+    target_dx,
+    target_dz,
+    max_grid_points,
+):
+    """
+    Build or retrieve one midpoint quadrature grid.
+
+    Grid spacing is never allowed to become coarser than the initial target.
+    """
+    key = grid_cache_key(
+        bounds,
+        target_dx,
+        target_dz,
+        max_grid_points,
+    )
+
+    if key in GRID_CACHE:
+        payload = GRID_CACHE.pop(key)
+        GRID_CACHE[key] = payload
+        return payload
+
+    x_span = bounds["x_upper"] - bounds["x_lower"]
+    z_span = bounds["z_upper"] - bounds["z_lower"]
+
+    n_x = max(
+        3,
+        int(math.ceil(x_span / target_dx)),
+    )
+
+    n_z = max(
+        3,
+        int(math.ceil(z_span / target_dz)),
+    )
+
+    candidate_count = n_x * n_z
+
+    if candidate_count > max_grid_points:
+        return None
+
+    actual_dx = x_span / n_x
+    actual_dz = z_span / n_z
+
+    x_points = (
+        bounds["x_lower"]
+        + (np.arange(n_x, dtype=float) + 0.5) * actual_dx
+    )
+
+    z_points = (
+        bounds["z_lower"]
+        + (np.arange(n_z, dtype=float) + 0.5) * actual_dz
+    )
+
+    x_mesh, z_mesh = np.meshgrid(
+        x_points,
+        z_points,
+        indexing="ij",
+    )
+
+    x_vector = x_mesh.ravel()
+    z_vector = z_mesh.ravel()
+
+    capacity_vector = (
+        I_REFERENCE * np.exp(x_vector)
+    )
+
+    lambda_vector = (
+        PAYMENT_PER_UNIT * np.exp(z_vector)
+    )
+
+    effort_matrix, probability_matrix = (
+        compute_forward_matrices(
+            capacity_vector,
+            lambda_vector,
+        )
+    )
+
+    payload = {
+        "bounds": dict(bounds),
+        "n_x": n_x,
+        "n_z": n_z,
+        "candidate_count": candidate_count,
+        "actual_dx": actual_dx,
+        "actual_dz": actual_dz,
+        "x_vector": x_vector,
+        "z_vector": z_vector,
+        "capacity_vector": capacity_vector,
+        "lambda_vector": lambda_vector,
+        "effort_matrix": effort_matrix,
+        "probability_matrix": probability_matrix,
+    }
+
+    GRID_CACHE[key] = payload
+
+    while len(GRID_CACHE) > GRID_CACHE_MAX_ENTRIES:
+        GRID_CACHE.popitem(last=False)
+
+    return payload
+
+
+# =====================================================================
+# 10. POSTERIOR FUNCTIONS
+# =====================================================================
+
+def normalize_log_weights(log_weights):
+    log_weights = np.asarray(log_weights, dtype=float)
+    finite_mask = np.isfinite(log_weights)
+
+    if not np.any(finite_mask):
+        return None
+
+    maximum = float(np.max(log_weights[finite_mask]))
+
+    shifted = np.zeros_like(log_weights)
+    shifted[finite_mask] = np.exp(
+        log_weights[finite_mask] - maximum
+    )
+
+    total = float(np.sum(shifted))
+
+    if total <= 0.0 or not np.isfinite(total):
+        return None
+
+    return shifted / total
+
+
+def compute_log_posterior(
+    payload,
+    prior_definition,
+    history_workloads,
+    history_outcomes,
+    observed_efforts_by_round,
+):
+    """
+    Full-history posterior on the current numerical grid.
+    """
+    log_weights = (
+        student_t_log_density(
+            payload["x_vector"],
+            X_PRIOR_LOCATION,
+            prior_definition["x_scale"],
+        )
+        + student_t_log_density(
+            payload["z_vector"],
+            Z_PRIOR_LOCATION,
+            prior_definition["z_scale"],
+        )
+    )
+
+    support_mask = np.ones(
+        payload["candidate_count"],
+        dtype=bool,
+    )
+
+    for history_index, (
+        round_number,
+        workload,
+        outcome,
+    ) in enumerate(
+        zip(
+            range(1, len(history_workloads) + 1),
+            history_workloads,
+            history_outcomes,
+        )
+    ):
+        workload_index = WORKLOAD_TO_INDEX[
+            float(workload)
+        ]
+
+        candidate_probabilities = payload[
+            "probability_matrix"
+        ][workload_index]
+
+        if int(outcome) == 1:
+            with np.errstate(divide="ignore"):
+                log_weights += np.log(
+                    candidate_probabilities
+                )
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                log_weights += np.log1p(
+                    -candidate_probabilities
+                )
+
+        if round_number in observed_efforts_by_round:
+            observed_effort = observed_efforts_by_round[
+                round_number
+            ]
+
+            support_mask &= np.isclose(
+                payload["effort_matrix"][
+                    workload_index
+                ],
+                observed_effort,
+                atol=1e-12,
+                rtol=0.0,
+            )
+
+    log_weights = log_weights.copy()
+    log_weights[~support_mask] = -np.inf
+
+    posterior = normalize_log_weights(log_weights)
+
+    return posterior, support_mask
+
+
+def boundary_masses(
+    posterior,
+    n_x,
+    n_z,
+    boundary_layers,
+):
+    matrix = posterior.reshape(n_x, n_z)
+
+    layers_x = min(boundary_layers, n_x)
+    layers_z = min(boundary_layers, n_z)
+
+    return {
+        "x_lower": float(
+            np.sum(matrix[:layers_x, :])
+        ),
+        "x_upper": float(
+            np.sum(matrix[-layers_x:, :])
+        ),
+        "z_lower": float(
+            np.sum(matrix[:, :layers_z])
+        ),
+        "z_upper": float(
+            np.sum(matrix[:, -layers_z:])
+        ),
+    }
+
+
+def expand_bounds(bounds, directions):
+    """
+    Expand indicated sides while keeping all existing points inside.
+    """
+    expanded = dict(bounds)
+
+    x_span = bounds["x_upper"] - bounds["x_lower"]
+    z_span = bounds["z_upper"] - bounds["z_lower"]
+
+    if "x_lower" in directions:
+        expanded["x_lower"] -= (
+            EXPANSION_SIDE_FRACTION * x_span
+        )
+
+    if "x_upper" in directions:
+        expanded["x_upper"] += (
+            EXPANSION_SIDE_FRACTION * x_span
+        )
+
+    if "z_lower" in directions:
+        expanded["z_lower"] -= (
+            EXPANSION_SIDE_FRACTION * z_span
+        )
+
+    if "z_upper" in directions:
+        expanded["z_upper"] += (
+            EXPANSION_SIDE_FRACTION * z_span
+        )
+
+    return expanded
+
+
+def bounds_are_numerically_safe(bounds):
+    values = [
+        bounds["x_lower"],
+        bounds["x_upper"],
+        bounds["z_lower"],
+        bounds["z_upper"],
+    ]
+
+    return all(
+        np.isfinite(value)
+        and abs(value) <= HARD_LOG_ABS_BOUND
+        for value in values
+    )
+
+
+def fit_history(
+    history_workloads,
+    history_outcomes,
+    observed_efforts_by_round,
+    prior_definition,
+    approximation_definition,
+    bounds,
+    target_dx,
+    target_dz,
+    expansion_events_used,
+):
+    """
+    Fit the current full history, expanding the grid when required.
+    """
+    adaptive = approximation_definition["adaptive"]
+    threshold = approximation_definition[
+        "boundary_mass_threshold"
+    ]
+
+    max_expansions = approximation_definition[
+        "max_expansion_events"
+    ]
+
+    boundary_layers = approximation_definition[
+        "boundary_layers"
+    ]
+
+    max_grid_points = approximation_definition[
+        "max_grid_points"
+    ]
+
+    collapse_expansion_events = 0
+    boundary_expansion_events = 0
+    adaptation_limit_reached = False
+
+    while True:
+        if not bounds_are_numerically_safe(bounds):
+            return {
+                "valid": False,
+                "failure_reason": "hard_log_bound",
+                "bounds": bounds,
+                "expansion_events_used": expansion_events_used,
+                "collapse_expansion_events": (
+                    collapse_expansion_events
+                ),
+                "boundary_expansion_events": (
+                    boundary_expansion_events
+                ),
+            }
+
+        payload = build_grid_payload(
+            bounds,
+            target_dx,
+            target_dz,
+            max_grid_points,
+        )
+
+        if payload is None:
+            return {
+                "valid": False,
+                "failure_reason": "grid_point_budget",
+                "bounds": bounds,
+                "expansion_events_used": expansion_events_used,
+                "collapse_expansion_events": (
+                    collapse_expansion_events
+                ),
+                "boundary_expansion_events": (
+                    boundary_expansion_events
+                ),
+            }
+
+        posterior, support_mask = compute_log_posterior(
+            payload,
+            prior_definition,
+            history_workloads,
+            history_outcomes,
+            observed_efforts_by_round,
+        )
+
+        support_size = int(np.sum(support_mask))
+
+        if posterior is None:
+            if (
+                not adaptive
+                or expansion_events_used >= max_expansions
+            ):
+                return {
+                    "valid": False,
+                    "failure_reason": "posterior_support_collapse",
+                    "bounds": bounds,
+                    "payload": payload,
+                    "support_size": support_size,
+                    "expansion_events_used": expansion_events_used,
+                    "collapse_expansion_events": (
+                        collapse_expansion_events
+                    ),
+                    "boundary_expansion_events": (
+                        boundary_expansion_events
+                    ),
+                }
+
+            bounds = expand_bounds(
+                bounds,
+                {
+                    "x_lower",
+                    "x_upper",
+                    "z_lower",
+                    "z_upper",
+                },
+            )
+
+            expansion_events_used += 1
+            collapse_expansion_events += 1
+            continue
+
+        masses = boundary_masses(
+            posterior,
+            payload["n_x"],
+            payload["n_z"],
+            boundary_layers,
+        )
+
+        if adaptive:
+            directions = {
+                side
+                for side, mass in masses.items()
+                if mass > threshold
+            }
+
+            if directions:
+                if expansion_events_used >= max_expansions:
+                    adaptation_limit_reached = True
+                else:
+                    bounds = expand_bounds(
+                        bounds,
+                        directions,
+                    )
+
+                    expansion_events_used += 1
+                    boundary_expansion_events += 1
+                    continue
+
+        predicted_curve = (
+            payload["probability_matrix"] @ posterior
+        )
+
+        effective_sample_size = float(
+            1.0 / np.sum(posterior**2)
+        )
+
+        return {
+            "valid": True,
+            "failure_reason": "",
+            "bounds": bounds,
+            "payload": payload,
+            "posterior": posterior,
+            "predicted_curve": predicted_curve,
+            "support_size": support_size,
+            "boundary_masses": masses,
+            "effective_sample_size": effective_sample_size,
+            "expansion_events_used": expansion_events_used,
+            "collapse_expansion_events": (
+                collapse_expansion_events
+            ),
+            "boundary_expansion_events": (
+                boundary_expansion_events
+            ),
+            "adaptation_limit_reached": (
+                adaptation_limit_reached
+            ),
+        }
+
+
+def run_sequential_inference(
+    outcomes,
+    true_training_efforts,
+    method_name,
+    prior_definition,
+    approximation_definition,
+):
+    """
+    Online inference over five rounds.
+
+    Expansion decisions use only observations available up to the current round.
+    """
+    bounds = initial_log_bounds(prior_definition)
+
+    initial_x_span = (
+        bounds["x_upper"] - bounds["x_lower"]
+    )
+
+    initial_z_span = (
+        bounds["z_upper"] - bounds["z_lower"]
+    )
+
+    initial_n = approximation_definition[
+        "initial_points_per_dimension"
+    ]
+
+    target_dx = initial_x_span / initial_n
+    target_dz = initial_z_span / initial_n
+
+    history_workloads = []
+    history_outcomes = []
+    observed_efforts_by_round = {}
+
+    expansion_events_used = 0
+    total_collapse_expansions = 0
+    total_boundary_expansions = 0
+
+    final_state = None
+
+    for round_index in range(HORIZON):
+        round_number = round_index + 1
+
+        history_workloads.append(
+            float(
+                TRAINING_WORKLOAD_SEQUENCE[
+                    round_index
+                ]
+            )
+        )
+
+        history_outcomes.append(
+            int(outcomes[round_index])
+        )
+
+        if (
+            method_name == "exact_spread2"
+            and round_number in MONITORED_ROUNDS
+        ):
+            observed_efforts_by_round[
+                round_number
+            ] = float(
+                true_training_efforts[
+                    round_index
+                ]
+            )
+
+        state = fit_history(
+            history_workloads=history_workloads,
+            history_outcomes=history_outcomes,
+            observed_efforts_by_round=observed_efforts_by_round,
+            prior_definition=prior_definition,
+            approximation_definition=approximation_definition,
+            bounds=bounds,
+            target_dx=target_dx,
+            target_dz=target_dz,
+            expansion_events_used=expansion_events_used,
+        )
+
+        total_collapse_expansions += state.get(
+            "collapse_expansion_events",
+            0,
+        )
+
+        total_boundary_expansions += state.get(
+            "boundary_expansion_events",
+            0,
+        )
+
+        expansion_events_used = state[
+            "expansion_events_used"
+        ]
+
+        bounds = state["bounds"]
+
+        if not state["valid"]:
+            return {
+                **state,
+                "failed_round": round_number,
+                "total_collapse_expansions": (
+                    total_collapse_expansions
+                ),
+                "total_boundary_expansions": (
+                    total_boundary_expansions
+                ),
+                "target_dx": target_dx,
+                "target_dz": target_dz,
+            }
+
+        final_state = state
+
+    original_bounds = log_bounds_to_original(
+        final_state["bounds"]
+    )
+
+    maximum_boundary_mass = max(
+        final_state["boundary_masses"].values()
+    )
+
+    return {
+        **final_state,
+        "failed_round": math.nan,
+        "total_collapse_expansions": (
+            total_collapse_expansions
+        ),
+        "total_boundary_expansions": (
+            total_boundary_expansions
+        ),
+        "target_dx": target_dx,
+        "target_dz": target_dz,
+        "maximum_boundary_mass": (
+            maximum_boundary_mass
+        ),
+        **original_bounds,
+    }
+
+
+# =====================================================================
+# 11. METRICS
+# =====================================================================
+
+def bernoulli_kl(
+    true_probability,
+    predicted_probability,
+):
+    p = np.clip(
+        np.asarray(true_probability, dtype=float),
+        PROBABILITY_CLIP,
+        1.0 - PROBABILITY_CLIP,
+    )
+
+    q = np.clip(
+        np.asarray(predicted_probability, dtype=float),
+        PROBABILITY_CLIP,
+        1.0 - PROBABILITY_CLIP,
+    )
+
+    return (
+        p * np.log(p / q)
+        + (1.0 - p) * np.log((1.0 - p) / (1.0 - q))
+    )
+
+
+def posterior_entropy(posterior):
+    positive = posterior > 0.0
+
+    return float(
+        -np.sum(
+            posterior[positive]
+            * np.log(posterior[positive])
+        )
+    )
+
+
+def compute_metrics(
+    inference_result,
+    true_curve,
+    true_capacity,
+    true_lambda,
+):
+    posterior = inference_result["posterior"]
+    payload = inference_result["payload"]
+    predicted_curve = inference_result[
+        "predicted_curve"
+    ]
+
+    metrics = {
+        "posterior_entropy": posterior_entropy(posterior),
+        "normalized_posterior_entropy": (
+            posterior_entropy(posterior)
+            / math.log(len(posterior))
+        ),
+        "posterior_mean_capacity": float(
+            np.dot(
+                posterior,
+                payload["capacity_vector"],
+            )
+        ),
+        "posterior_mean_lambda": float(
+            np.dot(
+                posterior,
+                payload["lambda_vector"],
+            )
+        ),
+        "posterior_effective_sample_size": (
+            inference_result[
+                "effective_sample_size"
+            ]
+        ),
+    }
+
+    metrics["capacity_absolute_error"] = abs(
+        metrics["posterior_mean_capacity"]
+        - true_capacity
+    )
+
+    metrics["lambda_absolute_error"] = abs(
+        metrics["posterior_mean_lambda"]
+        - true_lambda
+    )
+
+    for evaluation_name, indices in EVALUATION_INDICES.items():
+        target = true_curve[indices]
+        predicted = predicted_curve[indices]
+
+        absolute_error = np.abs(
+            predicted - target
+        )
+
+        squared_error = (
+            predicted - target
+        ) ** 2
+
+        kl_values = bernoulli_kl(
+            target,
+            predicted,
+        )
+
+        metrics[f"{evaluation_name}_mae"] = float(
+            np.mean(absolute_error)
+        )
+
+        metrics[f"{evaluation_name}_rmse"] = float(
+            np.sqrt(np.mean(squared_error))
+        )
+
+        metrics[
+            f"{evaluation_name}_mean_kl"
+        ] = float(np.mean(kl_values))
+
+        metrics[
+            f"{evaluation_name}_max_abs_error"
+        ] = float(np.max(absolute_error))
+
+    return metrics
+
+
+def sequence_probability(
+    outcomes,
+    true_probabilities,
+):
+    probability = 1.0
+
+    for outcome, success_probability_value in zip(
+        outcomes,
+        true_probabilities,
+    ):
+        probability *= (
+            success_probability_value
+            if outcome == 1
+            else 1.0 - success_probability_value
+        )
+
+    return float(probability)
+
+
+# =====================================================================
+# 12. PROGRESS TRACKER
+# =====================================================================
+
+class ProgressTracker:
+    def __init__(
+        self,
+        total_units,
+        report_every_percent=1.0,
+    ):
+        self.total_units = float(total_units)
+        self.completed_units = 0.0
+        self.report_every_percent = float(
+            report_every_percent
+        )
+        self.next_report_percent = 0.0
+        self.start_time = time.perf_counter()
+
+    @staticmethod
+    def format_seconds(seconds):
+        if not np.isfinite(seconds):
+            return "unknown"
+
+        seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        if hours > 0:
+            return (
+                f"{hours:d}h "
+                f"{minutes:02d}m "
+                f"{seconds:02d}s"
+            )
+
+        if minutes > 0:
+            return f"{minutes:d}m {seconds:02d}s"
+
+        return f"{seconds:d}s"
+
+    def update(self, units=1.0, context=""):
+        self.completed_units += float(units)
+
+        percent = min(
+            100.0,
+            100.0
+            * self.completed_units
+            / self.total_units,
+        )
+
+        if (
+            percent + 1e-12
+            < self.next_report_percent
+            and percent < 100.0
+        ):
+            return
+
+        elapsed = time.perf_counter() - self.start_time
+
+        if self.completed_units > 0.0:
+            estimated_total = (
+                elapsed
+                * self.total_units
+                / self.completed_units
+            )
+
+            eta = max(
+                0.0,
+                estimated_total - elapsed,
+            )
+        else:
+            eta = math.inf
+
+        suffix = f" | {context}" if context else ""
+
+        print(
+            f"Progress: {percent:6.2f}%"
+            f" | elapsed {self.format_seconds(elapsed)}"
+            f" | ETA {self.format_seconds(eta)}"
+            f"{suffix}",
+            flush=True,
+        )
+
+        while (
+            self.next_report_percent
+            <= percent + 1e-12
+        ):
+            self.next_report_percent += (
+                self.report_every_percent
+            )
+
+
+POSITIVE_SEQUENCE_UPPER_BOUND = 2 ** HORIZON
+
+TOTAL_INFERENCE_RUNS = (
+    len(PRIOR_DEFINITIONS)
+    * TRUE_WORKER_COUNT
+    * POSITIVE_SEQUENCE_UPPER_BOUND
+    * len(APPROXIMATION_DEFINITIONS)
+    * len(METHOD_NAMES)
+)
+
+progress_tracker = ProgressTracker(
+    TOTAL_INFERENCE_RUNS,
+    report_every_percent=1.0,
+)
+
+
+# =====================================================================
+# 13. EXACT ENUMERATION
+# =====================================================================
+
+sequence_result_rows = []
+paired_result_rows = []
+reference_curve_lookup = {}
+
+approximation_lookup = {
+    item["approximation"]: item
+    for item in APPROXIMATION_DEFINITIONS
+}
+
+processing_order = sorted(
+    APPROXIMATION_DEFINITIONS,
+    key=lambda item: (
+        not item["is_reference"],
+        item["approximation"],
+    ),
+)
+
+print(
+    "Starting Version 07 unknown-support exact enumeration.",
+    flush=True,
+)
+
+print(
+    f"Total planned inference runs: {TOTAL_INFERENCE_RUNS:,}",
+    flush=True,
+)
+
+for prior_number, prior_definition in enumerate(
+    PRIOR_DEFINITIONS,
+    start=1,
+):
+    prior_name = prior_definition["prior_name"]
+
+    for true_number, true_row in true_workers_df.iterrows():
+        true_type_id = true_row["true_type_id"]
+        true_data = true_worker_runtime[true_type_id]
+
+        true_training_efforts = true_data[
+            "training_efforts"
+        ]
+
+        true_training_probabilities = true_data[
+            "training_probabilities"
+        ]
+
+        true_curve = true_data[
+            "probability_curve"
+        ]
+
+        probability_mass_check = 0.0
+
+        for outcomes in product(
+            [0, 1],
+            repeat=HORIZON,
+        ):
+            sequence_weight = sequence_probability(
+                outcomes,
+                true_training_probabilities,
+            )
+
+            if (
+                sequence_weight
+                <= SEQUENCE_PROBABILITY_SKIP
+            ):
+                # Keep progress accounting exact even for impossible sequences.
+                skipped_runs = (
+                    len(APPROXIMATION_DEFINITIONS)
+                    * len(METHOD_NAMES)
+                )
+
+                progress_tracker.update(
+                    units=skipped_runs,
+                    context=(
+                        f"{prior_name}, "
+                        f"{true_type_id}, impossible sequence"
+                    ),
+                )
+                continue
+
+            probability_mass_check += sequence_weight
+
+            results_this_sequence = {}
+
+            for approximation_definition in processing_order:
+                approximation_name = approximation_definition[
+                    "approximation"
+                ]
+
+                for method_name in METHOD_NAMES:
+                    run_start = time.perf_counter()
+
+                    result = run_sequential_inference(
+                        outcomes=outcomes,
+                        true_training_efforts=(
+                            true_training_efforts
+                        ),
+                        method_name=method_name,
+                        prior_definition=prior_definition,
+                        approximation_definition=(
+                            approximation_definition
+                        ),
+                    )
+
+                    run_seconds = (
+                        time.perf_counter() - run_start
+                    )
+
+                    progress_tracker.update(
+                        units=1.0,
+                        context=(
+                            f"{prior_name}, "
+                            f"{true_type_id}, "
+                            f"{approximation_name}, "
+                            f"{method_name}"
+                        ),
+                    )
+
+                    row = {
+                        "prior_name": prior_name,
+                        "x_scale": prior_definition[
+                            "x_scale"
+                        ],
+                        "z_scale": prior_definition[
+                            "z_scale"
+                        ],
+                        "true_type_id": true_type_id,
+                        "test_category": true_row[
+                            "test_category"
+                        ],
+                        "true_capacity": float(
+                            true_row["capacity"]
+                        ),
+                        "true_lambda": float(
+                            true_row["lambda"]
+                        ),
+                        "outcome_sequence": "".join(
+                            str(value)
+                            for value in outcomes
+                        ),
+                        "sequence_probability": (
+                            sequence_weight
+                        ),
+                        "approximation": (
+                            approximation_name
+                        ),
+                        "adaptive": (
+                            approximation_definition[
+                                "adaptive"
+                            ]
+                        ),
+                        "is_reference": (
+                            approximation_definition[
+                                "is_reference"
+                            ]
+                        ),
+                        "method": method_name,
+                        "valid": bool(result["valid"]),
+                        "failure_reason": result.get(
+                            "failure_reason",
+                            "",
+                        ),
+                        "failed_round": result.get(
+                            "failed_round",
+                            math.nan,
+                        ),
+                        "runtime_seconds": run_seconds,
+                        "expansion_events_used": result.get(
+                            "expansion_events_used",
+                            0,
+                        ),
+                        "collapse_expansion_events": result.get(
+                            "total_collapse_expansions",
+                            0,
+                        ),
+                        "boundary_expansion_events": result.get(
+                            "total_boundary_expansions",
+                            0,
+                        ),
+                        "adaptation_limit_reached": result.get(
+                            "adaptation_limit_reached",
+                            False,
+                        ),
+                        "target_dx": result.get(
+                            "target_dx",
+                            math.nan,
+                        ),
+                        "target_dz": result.get(
+                            "target_dz",
+                            math.nan,
+                        ),
+                    }
+
+                    if result["valid"]:
+                        metrics = compute_metrics(
+                            inference_result=result,
+                            true_curve=true_curve,
+                            true_capacity=float(
+                                true_row["capacity"]
+                            ),
+                            true_lambda=float(
+                                true_row["lambda"]
+                            ),
+                        )
+
+                        row.update(metrics)
+
+                        payload = result["payload"]
+
+                        row.update(
+                            {
+                                "final_grid_points": (
+                                    payload[
+                                        "candidate_count"
+                                    ]
+                                ),
+                                "final_n_x": payload["n_x"],
+                                "final_n_z": payload["n_z"],
+                                "final_support_size": result[
+                                    "support_size"
+                                ],
+                                "maximum_boundary_mass": result[
+                                    "maximum_boundary_mass"
+                                ],
+                                "capacity_lower": result[
+                                    "capacity_lower"
+                                ],
+                                "capacity_upper": result[
+                                    "capacity_upper"
+                                ],
+                                "lambda_lower": result[
+                                    "lambda_lower"
+                                ],
+                                "lambda_upper": result[
+                                    "lambda_upper"
+                                ],
+                            }
+                        )
+
+                        reference_key = (
+                            prior_name,
+                            true_type_id,
+                            tuple(outcomes),
+                            method_name,
+                        )
+
+                        if approximation_definition[
+                            "is_reference"
+                        ]:
+                            reference_curve_lookup[
+                                reference_key
+                            ] = result[
+                                "predicted_curve"
+                            ].copy()
+
+                            row[
+                                "reference_all_curve_rmse"
+                            ] = 0.0
+
+                            row[
+                                "reference_heldout_near_curve_rmse"
+                            ] = 0.0
+
+                            row[
+                                "reference_heldout_full_curve_rmse"
+                            ] = 0.0
+                        else:
+                            reference_curve = (
+                                reference_curve_lookup.get(
+                                    reference_key
+                                )
+                            )
+
+                            if reference_curve is not None:
+                                difference = (
+                                    result[
+                                        "predicted_curve"
+                                    ]
+                                    - reference_curve
+                                )
+
+                                near_indices = (
+                                    EVALUATION_INDICES[
+                                        "heldout_near"
+                                    ]
+                                )
+
+                                full_indices = (
+                                    EVALUATION_INDICES[
+                                        "heldout_full"
+                                    ]
+                                )
+
+                                row[
+                                    "reference_all_curve_rmse"
+                                ] = float(
+                                    np.sqrt(
+                                        np.mean(
+                                            difference**2
+                                        )
+                                    )
+                                )
+
+                                row[
+                                    "reference_heldout_near_curve_rmse"
+                                ] = float(
+                                    np.sqrt(
+                                        np.mean(
+                                            difference[
+                                                near_indices
+                                            ] ** 2
+                                        )
+                                    )
+                                )
+
+                                row[
+                                    "reference_heldout_full_curve_rmse"
+                                ] = float(
+                                    np.sqrt(
+                                        np.mean(
+                                            difference[
+                                                full_indices
+                                            ] ** 2
+                                        )
+                                    )
+                                )
+                            else:
+                                row[
+                                    "reference_all_curve_rmse"
+                                ] = math.nan
+
+                                row[
+                                    "reference_heldout_near_curve_rmse"
+                                ] = math.nan
+
+                                row[
+                                    "reference_heldout_full_curve_rmse"
+                                ] = math.nan
+                    else:
+                        row["final_grid_points"] = math.nan
+                        row["final_n_x"] = math.nan
+                        row["final_n_z"] = math.nan
+                        row["final_support_size"] = math.nan
+                        row["maximum_boundary_mass"] = math.nan
+                        row["capacity_lower"] = math.nan
+                        row["capacity_upper"] = math.nan
+                        row["lambda_lower"] = math.nan
+                        row["lambda_upper"] = math.nan
+                        row["reference_all_curve_rmse"] = math.nan
+                        row[
+                            "reference_heldout_near_curve_rmse"
+                        ] = math.nan
+                        row[
+                            "reference_heldout_full_curve_rmse"
+                        ] = math.nan
+
+                    sequence_result_rows.append(row)
+
+                    results_this_sequence[
+                        (
+                            approximation_name,
+                            method_name,
+                        )
+                    ] = row
+
+            # Paired effort-aware versus outcome-only comparisons within each
+            # numerical approximation on the exact same outcome sequence.
+            for approximation_definition in APPROXIMATION_DEFINITIONS:
+                approximation_name = approximation_definition[
+                    "approximation"
+                ]
+
+                baseline = results_this_sequence[
+                    (
+                        approximation_name,
+                        "outcome_only",
+                    )
+                ]
+
+                effort_aware = results_this_sequence[
+                    (
+                        approximation_name,
+                        "exact_spread2",
+                    )
+                ]
+
+                pair_row = {
+                    "prior_name": prior_name,
+                    "true_type_id": true_type_id,
+                    "test_category": true_row[
+                        "test_category"
+                    ],
+                    "true_capacity": float(
+                        true_row["capacity"]
+                    ),
+                    "true_lambda": float(
+                        true_row["lambda"]
+                    ),
+                    "outcome_sequence": "".join(
+                        str(value)
+                        for value in outcomes
+                    ),
+                    "sequence_probability": (
+                        sequence_weight
+                    ),
+                    "approximation": (
+                        approximation_name
+                    ),
+                    "baseline_valid": baseline[
+                        "valid"
+                    ],
+                    "effort_aware_valid": (
+                        effort_aware["valid"]
+                    ),
+                    "both_valid": (
+                        baseline["valid"]
+                        and effort_aware["valid"]
+                    ),
+                }
+
+                if pair_row["both_valid"]:
+                    for metric_name in [
+                        "heldout_near_rmse",
+                        "heldout_near_mean_kl",
+                        "heldout_full_rmse",
+                        "all_workloads_rmse",
+                    ]:
+                        improvement = (
+                            baseline[metric_name]
+                            - effort_aware[metric_name]
+                        )
+
+                        pair_row[
+                            f"{metric_name}_improvement"
+                        ] = improvement
+
+                        pair_row[
+                            f"{metric_name}_better"
+                        ] = (
+                            improvement
+                            > METRIC_TIE_TOL
+                        )
+
+                        pair_row[
+                            f"{metric_name}_worse"
+                        ] = (
+                            improvement
+                            < -METRIC_TIE_TOL
+                        )
+
+                        pair_row[
+                            f"{metric_name}_tie"
+                        ] = (
+                            abs(improvement)
+                            <= METRIC_TIE_TOL
+                        )
+
+                paired_result_rows.append(pair_row)
+
+        assert np.isclose(
+            probability_mass_check,
+            1.0,
+            atol=1e-10,
+        ), (
+            f"Outcome probability did not sum to one for "
+            f"{prior_name}, {true_type_id}: "
+            f"{probability_mass_check}"
+        )
+
+
+progress_tracker.update(
+    units=max(
+        0.0,
+        TOTAL_INFERENCE_RUNS
+        - progress_tracker.completed_units,
+    )
+)
+
+print(
+    "Exact enumeration complete.",
+    flush=True,
+)
+
+
+# =====================================================================
+# 14. RAW RESULT TABLES
+# =====================================================================
+
+sequence_results_df = pd.DataFrame(
+    sequence_result_rows
+)
+
+paired_results_df = pd.DataFrame(
+    paired_result_rows
+)
+
+# Ensure all expected metric columns exist, even if an event never occurred.
+EXPECTED_METRIC_COLUMNS = [
+    "heldout_near_mae",
+    "heldout_near_rmse",
+    "heldout_near_mean_kl",
+    "heldout_near_max_abs_error",
+    "heldout_full_mae",
+    "heldout_full_rmse",
+    "heldout_full_mean_kl",
+    "heldout_full_max_abs_error",
+    "all_workloads_mae",
+    "all_workloads_rmse",
+    "all_workloads_mean_kl",
+    "all_workloads_max_abs_error",
+    "posterior_entropy",
+    "normalized_posterior_entropy",
+    "posterior_mean_capacity",
+    "posterior_mean_lambda",
+    "posterior_effective_sample_size",
+    "capacity_absolute_error",
+    "lambda_absolute_error",
+]
+
+for column in EXPECTED_METRIC_COLUMNS:
+    if column not in sequence_results_df.columns:
+        sequence_results_df[column] = np.nan
+
+PAIRED_BASE_METRICS = [
+    "heldout_near_rmse",
+    "heldout_near_mean_kl",
+    "heldout_full_rmse",
+    "all_workloads_rmse",
+]
+
+for base_metric in PAIRED_BASE_METRICS:
+    for suffix in [
+        "improvement",
+        "better",
+        "worse",
+        "tie",
+    ]:
+        column = f"{base_metric}_{suffix}"
+
+        if column not in paired_results_df.columns:
+            paired_results_df[column] = (
+                False
+                if suffix in {"better", "worse", "tie"}
+                else np.nan
+            )
+
+
+# =====================================================================
+# 15. WEIGHTED PER-TRUE-WORKER AGGREGATION
+# =====================================================================
+
+per_type_rows = []
+
+group_columns = [
+    "prior_name",
+    "true_type_id",
+    "test_category",
+    "true_capacity",
+    "true_lambda",
+    "approximation",
+    "adaptive",
+    "is_reference",
+    "method",
+]
+
+for group_key, group in sequence_results_df.groupby(
+    group_columns,
+    dropna=False,
+):
+    group_info = dict(
+        zip(group_columns, group_key)
+    )
+
+    valid_group = group[group["valid"]].copy()
+
+    valid_probability_mass = float(
+        valid_group["sequence_probability"].sum()
+    )
+
+    collapse_probability = (
+        1.0 - valid_probability_mass
+    )
+
+    row = {
+        **group_info,
+        "valid_probability_mass": (
+            valid_probability_mass
+        ),
+        "collapse_probability": (
+            collapse_probability
+        ),
+        "penalized_heldout_near_rmse": (
+            collapse_probability
+            * COLLAPSE_RMSE_PENALTY
+        ),
+    }
+
+    # Expansion/runtime summaries include failed sequences as well.
+    for column in [
+        "runtime_seconds",
+        "expansion_events_used",
+        "collapse_expansion_events",
+        "boundary_expansion_events",
+    ]:
+        row[f"expected_{column}"] = float(
+            np.sum(
+                group["sequence_probability"]
+                * group[column].fillna(0.0)
+            )
+        )
+
+    row[
+        "adaptation_limit_probability"
+    ] = float(
+        np.sum(
+            group["sequence_probability"]
+            * group[
+                "adaptation_limit_reached"
+            ].astype(float)
+        )
+    )
+
+    if valid_probability_mass > 0.0:
+        for column in (
+            EXPECTED_METRIC_COLUMNS
+            + [
+                "reference_all_curve_rmse",
+                "reference_heldout_near_curve_rmse",
+                "reference_heldout_full_curve_rmse",
+                "final_grid_points",
+                "final_n_x",
+                "final_n_z",
+                "final_support_size",
+                "maximum_boundary_mass",
+                "capacity_lower",
+                "capacity_upper",
+                "lambda_lower",
+                "lambda_upper",
+            ]
+        ):
+            weighted_value = float(
+                np.sum(
+                    valid_group[
+                        "sequence_probability"
+                    ]
+                    * valid_group[column]
+                )
+                / valid_probability_mass
+            )
+
+            row[column] = weighted_value
+
+        row[
+            "penalized_heldout_near_rmse"
+        ] += (
+            valid_probability_mass
+            * row["heldout_near_rmse"]
+        )
+
+    per_type_rows.append(row)
+
+per_type_summary_df = pd.DataFrame(
+    per_type_rows
+)
+
+
+# =====================================================================
+# 16. AGGREGATE ACROSS TRUE WORKERS
+# =====================================================================
+
+aggregate_rows = []
+
+aggregate_group_columns = [
+    "prior_name",
+    "approximation",
+    "adaptive",
+    "is_reference",
+    "method",
+]
+
+numeric_per_type_columns = [
+    column
+    for column in per_type_summary_df.columns
+    if column
+    not in {
+        "prior_name",
+        "true_type_id",
+        "test_category",
+        "true_capacity",
+        "true_lambda",
+        "approximation",
+        "adaptive",
+        "is_reference",
+        "method",
+    }
+]
+
+for group_key, group in per_type_summary_df.groupby(
+    aggregate_group_columns,
+    dropna=False,
+):
+    row = dict(
+        zip(
+            aggregate_group_columns,
+            group_key,
+        )
+    )
+
+    row["true_worker_count"] = len(group)
+
+    for column in numeric_per_type_columns:
+        row[column] = float(
+            group[column].mean(skipna=True)
+        )
+
+    aggregate_rows.append(row)
+
+aggregate_summary_df = pd.DataFrame(
+    aggregate_rows
+)
+
+
+# =====================================================================
+# 17. PAIRED EFFORT GAIN AGGREGATION
+# =====================================================================
+
+paired_per_type_rows = []
+
+paired_group_columns = [
+    "prior_name",
+    "true_type_id",
+    "test_category",
+    "true_capacity",
+    "true_lambda",
+    "approximation",
+]
+
+for group_key, group in paired_results_df.groupby(
+    paired_group_columns,
+    dropna=False,
+):
+    row = dict(
+        zip(paired_group_columns, group_key)
+    )
+
+    both_valid_group = group[
+        group["both_valid"]
+    ].copy()
+
+    both_valid_mass = float(
+        both_valid_group[
+            "sequence_probability"
+        ].sum()
+    )
+
+    row["both_valid_probability_mass"] = (
+        both_valid_mass
+    )
+
+    row["paired_invalid_probability"] = (
+        1.0 - both_valid_mass
+    )
+
+    if both_valid_mass > 0.0:
+        for base_metric in PAIRED_BASE_METRICS:
+            row[
+                f"{base_metric}_expected_improvement"
+            ] = float(
+                np.sum(
+                    both_valid_group[
+                        "sequence_probability"
+                    ]
+                    * both_valid_group[
+                        f"{base_metric}_improvement"
+                    ]
+                )
+                / both_valid_mass
+            )
+
+            for event_name in [
+                "better",
+                "worse",
+                "tie",
+            ]:
+                row[
+                    f"{base_metric}_probability_{event_name}"
+                ] = float(
+                    np.sum(
+                        both_valid_group[
+                            "sequence_probability"
+                        ]
+                        * both_valid_group[
+                            f"{base_metric}_{event_name}"
+                        ].astype(float)
+                    )
+                    / both_valid_mass
+                )
+
+    paired_per_type_rows.append(row)
+
+paired_per_type_df = pd.DataFrame(
+    paired_per_type_rows
+)
+
+paired_aggregate_rows = []
+
+for group_key, group in paired_per_type_df.groupby(
+    [
+        "prior_name",
+        "approximation",
+    ],
+    dropna=False,
+):
+    prior_name, approximation_name = group_key
+
+    row = {
+        "prior_name": prior_name,
+        "approximation": approximation_name,
+        "true_worker_count": len(group),
+    }
+
+    numeric_columns = [
+        column
+        for column in paired_per_type_df.columns
+        if column
+        not in {
+            "prior_name",
+            "true_type_id",
+            "test_category",
+            "true_capacity",
+            "true_lambda",
+            "approximation",
+        }
+    ]
+
+    for column in numeric_columns:
+        row[column] = float(
+            group[column].mean(skipna=True)
+        )
+
+    paired_aggregate_rows.append(row)
+
+paired_aggregate_df = pd.DataFrame(
+    paired_aggregate_rows
+)
+
+
+# =====================================================================
+# 18. FIXED-TO-ADAPTIVE RECOVERY
+# =====================================================================
+
+recovery_merge_columns = [
+    "prior_name",
+    "true_type_id",
+    "outcome_sequence",
+    "method",
+]
+
+fixed_rows = sequence_results_df[
+    sequence_results_df[
+        "approximation"
+    ] == "fixed_33"
+][
+    recovery_merge_columns
+    + [
+        "sequence_probability",
+        "valid",
+        "failure_reason",
+    ]
+].rename(
+    columns={
+        "valid": "fixed_valid",
+        "failure_reason": (
+            "fixed_failure_reason"
+        ),
+    }
+)
+
+adaptive_rows = sequence_results_df[
+    sequence_results_df[
+        "approximation"
+    ] == "adaptive_33"
+][
+    recovery_merge_columns
+    + [
+        "valid",
+        "expansion_events_used",
+        "heldout_near_rmse",
+    ]
+].rename(
+    columns={
+        "valid": "adaptive_valid",
+    }
+)
+
+recovery_by_sequence_df = fixed_rows.merge(
+    adaptive_rows,
+    on=recovery_merge_columns,
+    how="inner",
+)
+
+recovery_by_sequence_df[
+    "fixed_failed_adaptive_recovered"
+] = (
+    ~recovery_by_sequence_df[
+        "fixed_valid"
+    ]
+    & recovery_by_sequence_df[
+        "adaptive_valid"
+    ]
+)
+
+recovery_rows = []
+
+for group_key, group in recovery_by_sequence_df.groupby(
+    [
+        "prior_name",
+        "method",
+    ]
+):
+    prior_name, method_name = group_key
+
+    fixed_failure_mass = float(
+        np.sum(
+            group["sequence_probability"]
+            * (~group["fixed_valid"]).astype(float)
+        )
+    ) / TRUE_WORKER_COUNT
+
+    recovered_mass = float(
+        np.sum(
+            group["sequence_probability"]
+            * group[
+                "fixed_failed_adaptive_recovered"
+            ].astype(float)
+        )
+    ) / TRUE_WORKER_COUNT
+
+    recovery_rows.append(
+        {
+            "prior_name": prior_name,
+            "method": method_name,
+            "mean_fixed_failure_probability": (
+                fixed_failure_mass
+            ),
+            "mean_recovered_probability": (
+                recovered_mass
+            ),
+            "recovery_fraction_of_fixed_failures": (
+                recovered_mass / fixed_failure_mass
+                if fixed_failure_mass > 0.0
+                else math.nan
+            ),
+        }
+    )
+
+recovery_summary_df = pd.DataFrame(
+    recovery_rows
+)
+
+
+# =====================================================================
+# 19. PRIOR-SCALE SENSITIVITY
+# =====================================================================
+
+prior_sensitivity_rows = []
+
+for approximation_name in [
+    "adaptive_33",
+    REFERENCE_APPROXIMATION,
+]:
+    for method_name in METHOD_NAMES:
+        subset = aggregate_summary_df[
+            (
+                aggregate_summary_df[
+                    "approximation"
+                ] == approximation_name
+            )
+            & (
+                aggregate_summary_df[
+                    "method"
+                ] == method_name
+            )
+        ]
+
+        rmse_values = subset[
+            "heldout_near_rmse"
+        ].dropna()
+
+        collapse_values = subset[
+            "collapse_probability"
+        ].dropna()
+
+        prior_sensitivity_rows.append(
+            {
+                "approximation": (
+                    approximation_name
+                ),
+                "method": method_name,
+                "prior_scale_count": len(subset),
+                "heldout_near_rmse_min": float(
+                    rmse_values.min()
+                ),
+                "heldout_near_rmse_max": float(
+                    rmse_values.max()
+                ),
+                "heldout_near_rmse_range": float(
+                    rmse_values.max()
+                    - rmse_values.min()
+                ),
+                "collapse_probability_max": float(
+                    collapse_values.max()
+                ),
+                "prior_scale_tolerance_pass": bool(
+                    rmse_values.max()
+                    - rmse_values.min()
+                    <= PRIOR_SCALE_RMSE_RANGE_TOLERANCE
+                ),
+            }
+        )
+
+prior_sensitivity_df = pd.DataFrame(
+    prior_sensitivity_rows
+)
+
+
+# =====================================================================
+# 20. NUMERICAL SCREEN
+# =====================================================================
+
+screen_rows = []
+
+for _, row in aggregate_summary_df.iterrows():
+    screen_rows.append(
+        {
+            "prior_name": row["prior_name"],
+            "approximation": row[
+                "approximation"
+            ],
+            "method": row["method"],
+            "collapse_probability": row[
+                "collapse_probability"
+            ],
+            "heldout_near_rmse": row[
+                "heldout_near_rmse"
+            ],
+            "penalized_heldout_near_rmse": row[
+                "penalized_heldout_near_rmse"
+            ],
+            "reference_heldout_near_curve_rmse": row[
+                "reference_heldout_near_curve_rmse"
+            ],
+            "expected_expansion_events": row[
+                "expected_expansion_events_used"
+            ],
+            "expected_final_grid_points": row[
+                "final_grid_points"
+            ],
+            "expected_maximum_boundary_mass": row[
+                "maximum_boundary_mass"
+            ],
+            "collapse_tolerance_pass": bool(
+                row["collapse_probability"]
+                <= ADAPTIVE_COLLAPSE_TOLERANCE
+            ),
+            "reference_curve_tolerance_pass": bool(
+                (
+                    row["reference_heldout_near_curve_rmse"]
+                    <= REFERENCE_CURVE_RMSE_TOLERANCE
+                )
+                if not row["is_reference"]
+                else True
+            ),
+        }
+    )
+
+numerical_screen_df = pd.DataFrame(
+    screen_rows
+)
+
+numerical_screen_df[
+    "basic_screen_pass"
+] = (
+    numerical_screen_df[
+        "collapse_tolerance_pass"
+    ]
+    & numerical_screen_df[
+        "reference_curve_tolerance_pass"
+    ]
+)
+
+
+# =====================================================================
+# 21. SAVE TABLES
+# =====================================================================
+
+approximation_df = pd.DataFrame(
+    APPROXIMATION_DEFINITIONS
+)
+
+prior_df = pd.DataFrame(
+    PRIOR_DEFINITIONS
+)
+
+csv_tables = {
+    "01_prior_definitions.csv": prior_df,
+    "02_prior_initial_regions.csv": prior_regions_df,
+    "03_approximation_definitions.csv": approximation_df,
+    "04_true_workers.csv": true_workers_df,
+    "05_sequence_results.csv": sequence_results_df,
+    "06_per_true_worker_summary.csv": per_type_summary_df,
+    "07_aggregate_summary.csv": aggregate_summary_df,
+    "08_paired_sequence_results.csv": paired_results_df,
+    "09_paired_gains_by_true_worker.csv": paired_per_type_df,
+    "10_paired_gains_aggregate.csv": paired_aggregate_df,
+    "11_fixed_to_adaptive_recovery_by_sequence.csv": (
+        recovery_by_sequence_df
+    ),
+    "12_fixed_to_adaptive_recovery_summary.csv": (
+        recovery_summary_df
+    ),
+    "13_prior_scale_sensitivity.csv": (
+        prior_sensitivity_df
+    ),
+    "14_numerical_screen.csv": numerical_screen_df,
+}
+
+for filename, dataframe in csv_tables.items():
+    dataframe.to_csv(
+        OUTPUT_DIR / filename,
+        index=False,
+    )
+
+
+# =====================================================================
+# 22. CONFIGURATION JSON
+# =====================================================================
+
+configuration = {
+    "script_label": SCRIPT_LABEL,
+    "beta": BETA,
+    "payment_per_unit": PAYMENT_PER_UNIT,
+    "effort_step": EFFORT_STEP,
+    "effort_grid": EFFORT_GRID.tolist(),
+    "all_workloads": ALL_WORKLOADS.tolist(),
+    "training_workload_sequence": (
+        TRAINING_WORKLOAD_SEQUENCE.tolist()
+    ),
+    "heldout_near_workloads": (
+        HELDOUT_NEAR_WORKLOADS.tolist()
+    ),
+    "heldout_full_workloads": (
+        HELDOUT_FULL_WORKLOADS.tolist()
+    ),
+    "monitored_rounds": MONITORED_ROUNDS,
+    "monitored_workloads": MONITORED_WORKLOADS,
+    "methods": METHOD_NAMES,
+    "i_reference": I_REFERENCE,
+    "prior_median_capacity": (
+        PRIOR_MEDIAN_CAPACITY
+    ),
+    "prior_median_lambda": (
+        PRIOR_MEDIAN_LAMBDA
+    ),
+    "prior_df": PRIOR_DF,
+    "prior_definitions": PRIOR_DEFINITIONS,
+    "initial_marginal_prior_mass": (
+        INITIAL_MARGINAL_PRIOR_MASS
+    ),
+    "approximation_definitions": (
+        APPROXIMATION_DEFINITIONS
+    ),
+    "reference_approximation": (
+        REFERENCE_APPROXIMATION
+    ),
+    "expansion_side_fraction": (
+        EXPANSION_SIDE_FRACTION
+    ),
+    "hard_log_abs_bound": (
+        HARD_LOG_ABS_BOUND
+    ),
+    "true_worker_definitions": (
+        TRUE_WORKER_DEFINITIONS
+    ),
+    "argmax_tolerance": ARGMAX_TOL,
+    "probability_clip": PROBABILITY_CLIP,
+    "sequence_probability_skip": (
+        SEQUENCE_PROBABILITY_SKIP
+    ),
+    "metric_tie_tolerance": (
+        METRIC_TIE_TOL
+    ),
+    "collapse_rmse_penalty": (
+        COLLAPSE_RMSE_PENALTY
+    ),
+    "grid_cache_max_entries": (
+        GRID_CACHE_MAX_ENTRIES
+    ),
+    "reference_curve_rmse_tolerance": (
+        REFERENCE_CURVE_RMSE_TOLERANCE
+    ),
+    "adaptive_collapse_tolerance": (
+        ADAPTIVE_COLLAPSE_TOLERANCE
+    ),
+    "prior_scale_rmse_range_tolerance": (
+        PRIOR_SCALE_RMSE_RANGE_TOLERANCE
+    ),
+    "random_seed": None,
+    "outcome_enumeration": "exact",
+}
+
+with open(
+    OUTPUT_DIR / "00_configuration.json",
+    "w",
+    encoding="utf-8",
+) as file:
+    json.dump(
+        configuration,
+        file,
+        indent=2,
+    )
+
+
+# =====================================================================
+# 23. FIGURES
+# =====================================================================
+
+# Figure 1: collapse probability.
+collapse_plot = aggregate_summary_df.copy()
+
+labels = [
+    f"{row.prior_name}\n{row.approximation}\n{row.method}"
+    for row in collapse_plot.itertuples()
+]
+
+plt.figure(figsize=(16, 7))
+x_positions = np.arange(len(collapse_plot))
+
+plt.bar(
+    x_positions,
+    collapse_plot[
+        "collapse_probability"
+    ],
+)
+
+plt.xticks(
+    x_positions,
+    labels,
+    rotation=70,
+    ha="right",
+)
+
+plt.ylabel("Expected posterior-collapse probability")
+plt.title("Unknown-Support Numerical Failure")
+plt.ylim(0.0, 1.05)
+plt.grid(True, axis="y", alpha=0.3)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_01_collapse_probability.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 2: predictive RMSE.
+rmse_plot = aggregate_summary_df.copy()
+
+plt.figure(figsize=(13, 7))
+
+for approximation_name in [
+    "fixed_33",
+    "adaptive_33",
+    REFERENCE_APPROXIMATION,
+]:
+    for method_name in METHOD_NAMES:
+        subset = rmse_plot[
+            (
+                rmse_plot[
+                    "approximation"
+                ] == approximation_name
+            )
+            & (
+                rmse_plot[
+                    "method"
+                ] == method_name
+            )
+        ].set_index("prior_name").loc[
+            [
+                "moderately_broad",
+                "broad",
+                "very_broad",
+            ]
+        ].reset_index()
+
+        plt.plot(
+            subset["prior_name"],
+            subset["penalized_heldout_near_rmse"],
+            marker="o",
+            label=(
+                f"{approximation_name}, "
+                f"{method_name}"
+            ),
+        )
+
+plt.ylabel("Penalized expected held-out-near RMSE")
+plt.title("Predictive Accuracy Without Known Parameter Bounds")
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_02_predictive_rmse.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 3: numerical difference from adaptive reference.
+reference_plot = aggregate_summary_df[
+    aggregate_summary_df[
+        "approximation"
+    ].isin(
+        [
+            "fixed_33",
+            "adaptive_33",
+        ]
+    )
+].copy()
+
+plt.figure(figsize=(11, 7))
+
+for approximation_name in [
+    "fixed_33",
+    "adaptive_33",
+]:
+    for method_name in METHOD_NAMES:
+        subset = reference_plot[
+            (
+                reference_plot[
+                    "approximation"
+                ] == approximation_name
+            )
+            & (
+                reference_plot[
+                    "method"
+                ] == method_name
+            )
+        ].set_index("prior_name").loc[
+            [
+                "moderately_broad",
+                "broad",
+                "very_broad",
+            ]
+        ].reset_index()
+
+        plt.plot(
+            subset["prior_name"],
+            subset[
+                "reference_heldout_near_curve_rmse"
+            ],
+            marker="o",
+            label=(
+                f"{approximation_name}, "
+                f"{method_name}"
+            ),
+        )
+
+plt.axhline(
+    REFERENCE_CURVE_RMSE_TOLERANCE,
+    linestyle="--",
+    label="provisional tolerance",
+)
+plt.ylabel("RMSE from adaptive 65-point reference")
+plt.title("Numerical Accuracy of Fixed and Adaptive 33-Point Grids")
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_03_reference_curve_error.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 4: expected expansions.
+expansion_plot = aggregate_summary_df[
+    aggregate_summary_df[
+        "approximation"
+    ].isin(
+        [
+            "adaptive_33",
+            REFERENCE_APPROXIMATION,
+        ]
+    )
+].copy()
+
+plt.figure(figsize=(11, 7))
+
+for approximation_name in [
+    "adaptive_33",
+    REFERENCE_APPROXIMATION,
+]:
+    for method_name in METHOD_NAMES:
+        subset = expansion_plot[
+            (
+                expansion_plot[
+                    "approximation"
+                ] == approximation_name
+            )
+            & (
+                expansion_plot[
+                    "method"
+                ] == method_name
+            )
+        ].set_index("prior_name").loc[
+            [
+                "moderately_broad",
+                "broad",
+                "very_broad",
+            ]
+        ].reset_index()
+
+        plt.plot(
+            subset["prior_name"],
+            subset[
+                "expected_expansion_events_used"
+            ],
+            marker="o",
+            label=(
+                f"{approximation_name}, "
+                f"{method_name}"
+            ),
+        )
+
+plt.ylabel("Expected expansion events")
+plt.title("How Often the Numerical Region Expands")
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_04_expected_expansions.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 5: expected final grid size.
+grid_size_plot = aggregate_summary_df[
+    aggregate_summary_df[
+        "approximation"
+    ].isin(
+        [
+            "adaptive_33",
+            REFERENCE_APPROXIMATION,
+        ]
+    )
+].copy()
+
+plt.figure(figsize=(11, 7))
+
+for approximation_name in [
+    "adaptive_33",
+    REFERENCE_APPROXIMATION,
+]:
+    for method_name in METHOD_NAMES:
+        subset = grid_size_plot[
+            (
+                grid_size_plot[
+                    "approximation"
+                ] == approximation_name
+            )
+            & (
+                grid_size_plot[
+                    "method"
+                ] == method_name
+            )
+        ].set_index("prior_name").loc[
+            [
+                "moderately_broad",
+                "broad",
+                "very_broad",
+            ]
+        ].reset_index()
+
+        plt.plot(
+            subset["prior_name"],
+            subset["final_grid_points"],
+            marker="o",
+            label=(
+                f"{approximation_name}, "
+                f"{method_name}"
+            ),
+        )
+
+plt.ylabel("Expected final quadrature points")
+plt.title("Computational Cost of Unknown-Support Adaptation")
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_05_final_grid_size.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 6: effort-aware predictive gain.
+gain_plot = paired_aggregate_df.copy()
+
+plt.figure(figsize=(11, 7))
+
+for approximation_name in [
+    "fixed_33",
+    "adaptive_33",
+    REFERENCE_APPROXIMATION,
+]:
+    subset = gain_plot[
+        gain_plot[
+            "approximation"
+        ] == approximation_name
+    ].set_index("prior_name").loc[
+        [
+            "moderately_broad",
+            "broad",
+            "very_broad",
+        ]
+    ].reset_index()
+
+    plt.plot(
+        subset["prior_name"],
+        subset[
+            "heldout_near_rmse_"
+            "expected_improvement"
+        ],
+        marker="o",
+        label=approximation_name,
+    )
+
+plt.axhline(0.0, linestyle="--")
+plt.ylabel("Expected RMSE improvement from effort")
+plt.title("Predictive Value of Effort Without Known Parameter Bounds")
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_06_effort_gain.png",
+    dpi=200,
+)
+plt.show()
+
+
+# Figure 7: adaptive performance by worker category.
+category_plot = (
+    per_type_summary_df[
+        (
+            per_type_summary_df[
+                "approximation"
+            ] == "adaptive_33"
+        )
+        & (
+            per_type_summary_df[
+                "method"
+            ] == "exact_spread2"
+        )
+    ]
+    .groupby(
+        [
+            "prior_name",
+            "test_category",
+        ],
+        as_index=False,
+    )[
+        [
+            "penalized_heldout_near_rmse",
+            "collapse_probability",
+            "expected_expansion_events_used",
+        ]
+    ]
+    .mean()
+)
+
+categories = category_plot[
+    "test_category"
+].unique().tolist()
+
+plt.figure(figsize=(12, 7))
+
+for category in categories:
+    subset = category_plot[
+        category_plot[
+            "test_category"
+        ] == category
+    ].set_index("prior_name").loc[
+        [
+            "moderately_broad",
+            "broad",
+            "very_broad",
+        ]
+    ].reset_index()
+
+    plt.plot(
+        subset["prior_name"],
+        subset[
+            "penalized_heldout_near_rmse"
+        ],
+        marker="o",
+        label=category,
+    )
+
+plt.ylabel("Penalized held-out-near RMSE")
+plt.title("Adaptive Effort-Aware Prediction by Worker Category")
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "figure_07_worker_category_performance.png",
+    dpi=200,
+)
+plt.show()
+
+
+# =====================================================================
+# 24. TEXT SUMMARY
+# =====================================================================
+
+summary_lines = [
+    "TASK 4 V07: UNKNOWN-SUPPORT ADAPTIVE POSTERIOR AUDIT",
+    "=" * 74,
+    "",
+    "Core question:",
+    (
+        "Can the learner predict reliability without being given the true "
+        "minimum and maximum values of C and lambda?"
+    ),
+    "",
+    "Model:",
+    "  C > 0 and lambda > 0 are continuous.",
+    "  Effort remains discrete on {0, 0.05, ..., 1.00}.",
+    (
+        "  Inference uses unbounded Student-t priors in log-parameter "
+        "coordinates."
+    ),
+    (
+        "  Initial numerical regions come from prior probability mass, "
+        "not true parameter bounds."
+    ),
+    "",
+    f"True evaluation workers: {TRUE_WORKER_COUNT}",
+    f"Prior scales: {len(PRIOR_DEFINITIONS)}",
+    f"Outcome sequences per worker: {2 ** HORIZON}",
+    (
+        "Monitoring: exact effort in rounds "
+        f"{MONITORED_ROUNDS}, workloads {MONITORED_WORKLOADS}"
+    ),
+    "",
+    "Aggregate results:",
+]
+
+for prior_name in [
+    "moderately_broad",
+    "broad",
+    "very_broad",
+]:
+    summary_lines.append(
+        f"  Prior: {prior_name}"
+    )
+
+    subset = aggregate_summary_df[
+        aggregate_summary_df[
+            "prior_name"
+        ] == prior_name
+    ].sort_values(
+        [
+            "approximation",
+            "method",
+        ]
+    )
+
+    for _, row in subset.iterrows():
+        summary_lines.append(
+            "    "
+            f"{row['approximation']}, "
+            f"{row['method']}: "
+            f"collapse="
+            f"{row['collapse_probability']:.4f}, "
+            f"RMSE="
+            f"{row['heldout_near_rmse']:.6f}, "
+            f"penalized RMSE="
+            f"{row['penalized_heldout_near_rmse']:.6f}, "
+            f"expansions="
+            f"{row['expected_expansion_events_used']:.3f}, "
+            f"final points="
+            f"{row['final_grid_points']:.1f}"
+        )
+
+summary_lines.extend(
+    [
+        "",
+        "Interpretation cautions:",
+        (
+            "  - The adaptive learner does not know the true worker range. "
+            "The true values are used only to calculate evaluation error."
+        ),
+        (
+            "  - The reference_65 method is a finer numerical reference, "
+            "not an analytic posterior."
+        ),
+        (
+            "  - Failure to expand can be rational when observations are "
+            "predictively compatible with an interior parameter region."
+        ),
+        (
+            "  - Exact effort matching still assumes deterministic worker "
+            "choice and exact monitoring."
+        ),
+        (
+            "  - This version tests one worker at a time. Multiple workers, "
+            "population transfer, allocation, and utility remain separate."
+        ),
+        "",
+        "Upload the complete ZIP package for interpretation.",
+    ]
+)
+
+summary_text = "\n".join(summary_lines)
+
+with open(
+    OUTPUT_DIR / "15_summary.txt",
+    "w",
+    encoding="utf-8",
+) as file:
+    file.write(summary_text)
+
+
+# =====================================================================
+# 25. FINAL VALIDATION AND PRINTING
+# =====================================================================
+
+assert not aggregate_summary_df.empty
+assert not paired_aggregate_df.empty
+assert not recovery_summary_df.empty
+assert not numerical_screen_df.empty
+
+pd.set_option("display.max_rows", 400)
+pd.set_option("display.max_columns", 160)
+pd.set_option("display.width", 260)
+pd.set_option(
+    "display.float_format",
+    lambda value: f"{value:0.6f}",
+)
+
+print("=" * 116)
+print("TASK 4 V07: UNKNOWN-SUPPORT ADAPTIVE POSTERIOR AUDIT")
+print("=" * 116)
+print()
+print(summary_text)
+print()
+
+print("=" * 116)
+print("AGGREGATE SUMMARY")
+print("=" * 116)
+display(
+    aggregate_summary_df[
+        [
+            "prior_name",
+            "approximation",
+            "method",
+            "collapse_probability",
+            "heldout_near_rmse",
+            "penalized_heldout_near_rmse",
+            "heldout_near_mean_kl",
+            "reference_heldout_near_curve_rmse",
+            "expected_expansion_events_used",
+            "expected_runtime_seconds",
+            "final_grid_points",
+            "maximum_boundary_mass",
+        ]
+    ].sort_values(
+        [
+            "prior_name",
+            "approximation",
+            "method",
+        ]
+    )
+)
+
+print("=" * 116)
+print("EFFORT-AWARE PAIRED GAINS")
+print("=" * 116)
+display(
+    paired_aggregate_df[
+        [
+            "prior_name",
+            "approximation",
+            "paired_invalid_probability",
+            "heldout_near_rmse_expected_improvement",
+            "heldout_near_rmse_probability_better",
+            "heldout_near_rmse_probability_worse",
+            "heldout_near_rmse_probability_tie",
+        ]
+    ].sort_values(
+        [
+            "prior_name",
+            "approximation",
+        ]
+    )
+)
+
+print("=" * 116)
+print("FIXED-TO-ADAPTIVE RECOVERY")
+print("=" * 116)
+display(recovery_summary_df)
+
+print("=" * 116)
+print("PRIOR-SCALE SENSITIVITY")
+print("=" * 116)
+display(prior_sensitivity_df)
+
+print("=" * 116)
+print("NUMERICAL SCREEN")
+print("=" * 116)
+display(numerical_screen_df)
+
+print("=" * 116)
+print("PER-WORKER ADAPTIVE EFFORT-AWARE RESULTS")
+print("=" * 116)
+display(
+    per_type_summary_df[
+        (
+            per_type_summary_df[
+                "approximation"
+            ] == "adaptive_33"
+        )
+        & (
+            per_type_summary_df[
+                "method"
+            ] == "exact_spread2"
+        )
+    ][
+        [
+            "prior_name",
+            "true_type_id",
+            "test_category",
+            "true_capacity",
+            "true_lambda",
+            "collapse_probability",
+            "heldout_near_rmse",
+            "penalized_heldout_near_rmse",
+            "reference_heldout_near_curve_rmse",
+            "expected_expansion_events_used",
+            "final_grid_points",
+            "maximum_boundary_mass",
+        ]
+    ].sort_values(
+        [
+            "prior_name",
+            "test_category",
+            "true_type_id",
+        ]
+    )
+)
+
+
+# =====================================================================
+# 26. ZIP PACKAGE
+# =====================================================================
+
+with zipfile.ZipFile(
+    ZIP_PATH,
+    mode="w",
+    compression=zipfile.ZIP_DEFLATED,
+) as zip_file:
+    for file_path in sorted(
+        OUTPUT_DIR.rglob("*")
+    ):
+        if file_path.is_file():
+            zip_file.write(
+                file_path,
+                arcname=file_path.relative_to(
+                    OUTPUT_DIR
+                ),
+            )
+
+print()
+print("=" * 116)
+print("OUTPUT PACKAGE CREATED")
+print("=" * 116)
+print(f"Output directory: {OUTPUT_DIR}")
+print(f"ZIP file:         {ZIP_PATH}")
+print(
+    f"ZIP size:         "
+    f"{ZIP_PATH.stat().st_size / 1024:.1f} KB"
+)
+print()
+print(
+    "Upload the complete ZIP file. It contains all numerical tables, "
+    "configuration, summary, and figures."
+)
+
+
+# =====================================================================
+# 27. AUTOMATIC COLAB DOWNLOAD
+# =====================================================================
+
+try:
+    from google.colab import files
+
+    files.download(str(ZIP_PATH))
+except ImportError:
+    print(
+        "Not running in Google Colab, so automatic download was skipped."
+    )
+except Exception as error:
+    print(
+        "Automatic download could not start. "
+        f"Download the ZIP manually from: {ZIP_PATH}"
+    )
+    print(f"Download error: {error}")
